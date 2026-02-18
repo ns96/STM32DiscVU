@@ -1,0 +1,32 @@
+# Build artifacts
+Debug/
+Release/
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.obj
+*.su
+
+# STM32CubeIDE / Eclipse
+.settings/
+.project
+.cproject
+*.launch
+
+# VS Code
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation / Artifacts (Optional: remove if you want to keep them)
+task.md
+implementation_plan.md
+walkthrough.md
