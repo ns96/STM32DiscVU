@@ -152,6 +152,8 @@ static bool GetMappedRecord(char side, int totalTime, char* outHash, char* outFu
 }
 
 // --- FSK Debug & Config ---
+static float g_BaudRates[] = {300.0f, 600.0f, 1100.0f, 1200.0f, 1300.0f};
+static int g_BaudIdx = 3; // Default to 1200
 static float g_BaudRate = 1200.0f;
 static uint32_t g_LastDebugTime = 0;
 float g_MaxSignalLevel = 0.0f;
@@ -339,6 +341,7 @@ typedef struct {
     int sideBLineCount;
     char currentSide;
     bool isDctMode;
+    int lastTotalTime;
 } TapeStats;
 
 static TapeStats g_TapeStats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', false};
@@ -418,6 +421,7 @@ static void Tape_ProcessLine(char* line) {
             if (g_TapeStats.isDctMode) {
                 // DCT Mode: Use Timecode to find Real Hash and Full Line from side file
                 int totalTime = atoi(parts[4]);
+                g_TapeStats.lastTotalTime = totalTime;
                 char mappedFullLine[32] = {0};
                 if (GetMappedRecord(g_TapeStats.currentSide, totalTime, lookupHash, mappedFullLine)) {
                     readyToLookup = true;
@@ -430,6 +434,7 @@ static void Tape_ProcessLine(char* line) {
                 }
             } else {
                 // Generic Mode: Use the Hash directly from the line
+                g_TapeStats.lastTotalTime = atoi(parts[4]);
                 if (strlen(hash) == 10) {
                     strncpy(lookupHash, hash, 11);
                     readyToLookup = true;
@@ -765,7 +770,7 @@ void Visualizer_Update(void) {
         for(int i=0; i<64; i++) fft_mag_sim[i] = (uint8_t)((sinf(simP + i*0.2f) + 1.0f) * 127.0f);
     } else if (fftIdx >= FFT_SIZE) {
         // 1. Process FFT with 50% overlap (every 256 samples)
-        if (g_SpectrumMode == 1) {
+        if (g_SpectrumMode == 1 || g_SpectrumMode == 3) {
             // Compute Left FFT
             memcpy(vRealFFT, vRealL, sizeof(vRealFFT)); 
             memset(vImagFFT, 0, sizeof(vImagFFT));
@@ -1022,6 +1027,77 @@ static void drawSpectrum() {
 
                 for(int py=0; py<2; py++) {
                     uint32_t* row = &back_fb[(peakY + py) * 480 + (startX + i*barW)];
+                    for(int px=0; px<(barW-1); px++) row[px] = peakColor;
+                }
+            }
+        }
+    } else if (g_SpectrumMode == 3) {
+        // --- 31/31 ISO Standard Stereo Split LED Mode ---
+        int barW = 7; 
+        int totalW = 31 * barW;
+        int leftX = (240 - totalW) / 2;
+        int rightX = 240 + (240 - totalW) / 2;
+        int segH = 4;
+        int gap = 1;
+        int totalSegH = segH + gap;
+
+        // Draw Divider
+        for(int i=UI_VIZ_TOP; i<UI_VIZ_BOTTOM; i++) back_fb[i*480 + 240] = 0xFF555555;
+
+        for(int i=0; i<31; i++) {
+            // LEFT CHANNEL LED
+            int hL = (g_SimulationMode) ? (fft_mag_sim[i] * maxH) / 255 : getLogBarHeight(vRealFFTL, i, maxH, g_SpectrumGain, g_ISO31_Map, 31);
+            if (g_EnablePeakHold) {
+                if ((float)hL >= g_SpectrumPeaks[i]) { g_SpectrumPeaks[i] = (float)hL; g_PeakHoldCount[i] = g_PeakHoldFrames; }
+            }
+            int numSegsL = hL / totalSegH;
+            for (int s = 0; s < numSegsL; s++) {
+                uint32_t segColor;
+                float percent = (float)(s * totalSegH) / (float)maxH;
+                if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
+                else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
+                else segColor = LCD_COLOR_RED;
+                FillRectDMA2D(back_fb, leftX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+            }
+            if (g_EnablePeakHold) {
+                int peakY = bottomY - (int)g_SpectrumPeaks[i];
+                if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
+                uint32_t peakColor;
+                float pPercent = (float)(g_SpectrumPeaks[i]) / (float)maxH;
+                if (pPercent < 0.6f) peakColor = LCD_COLOR_GREEN;
+                else if (pPercent < 0.85f) peakColor = LCD_COLOR_YELLOW;
+                else peakColor = LCD_COLOR_RED;
+                for(int py=0; py<2; py++) {
+                    uint32_t* row = &back_fb[(peakY + py) * 480 + (leftX + i*barW)];
+                    for(int px=0; px<(barW-1); px++) row[px] = peakColor;
+                }
+            }
+
+            // RIGHT CHANNEL LED
+            int hR = (g_SimulationMode) ? (fft_mag_sim[i] * maxH) / 255 : getLogBarHeight(vRealFFTR, i, maxH, g_SpectrumGain, g_ISO31_Map, 31);
+            int rIdx = 31 + i;
+            if (g_EnablePeakHold) {
+                if ((float)hR >= g_SpectrumPeaks[rIdx]) { g_SpectrumPeaks[rIdx] = (float)hR; g_PeakHoldCount[rIdx] = g_PeakHoldFrames; }
+            }
+            int numSegsR = hR / totalSegH;
+            for (int s = 0; s < numSegsR; s++) {
+                uint32_t segColor;
+                float percent = (float)(s * totalSegH) / (float)maxH;
+                if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
+                else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
+                else segColor = LCD_COLOR_RED;
+                FillRectDMA2D(back_fb, rightX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+            }
+            if (g_EnablePeakHold) {
+                int peakY = bottomY - (int)g_SpectrumPeaks[rIdx];
+                if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
+                uint32_t peakColor;
+                float pPercent = (float)(g_SpectrumPeaks[rIdx]) / (float)maxH;
+                if (pPercent < 0.6f) peakColor = LCD_COLOR_GREEN;
+                else if (pPercent < 0.85f) peakColor = LCD_COLOR_YELLOW;
+                else peakColor = LCD_COLOR_RED;
+                for(int py=0; py<2; py++) {
+                    uint32_t* row = &back_fb[(peakY + py) * 480 + (rightX + i*barW)];
                     for(int px=0; px<(barW-1); px++) row[px] = peakColor;
                 }
             }
@@ -1290,7 +1366,10 @@ static void drawFSKText(void) {
     BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
 
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-    snprintf(sBuf, sizeof(sBuf), "Total: %d", g_TapeStats.logLineCount);
+    int h = g_TapeStats.lastTotalTime / 3600;
+    int m = (g_TapeStats.lastTotalTime % 3600) / 60;
+    int s = g_TapeStats.lastTotalTime % 60;
+    snprintf(sBuf, sizeof(sBuf), "Total: %d (%02d:%02d:%02d)", g_TapeStats.logLineCount, h, m, s);
     BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
     
     snprintf(sBuf, sizeof(sBuf), "Errors: %d", g_TapeStats.dataErrors);
@@ -1377,8 +1456,8 @@ static void handleTouch() {
                     g_CurrentLineIdx = 0;
                     xTaskResumeAll();
                 } else if (g_ShowSpectrum) {
-                    // Cycle Spectrum Modes: Mono -> Split -> LED
-                    g_SpectrumMode = (g_SpectrumMode + 1) % 3;
+                    // Cycle Spectrum Modes: Mono -> Split -> Mono LED -> Split LED
+                    g_SpectrumMode = (g_SpectrumMode + 1) % 4;
                 }
             } else if (zone == 1) { // Middle third: Toggle Peak Hold
                 g_EnablePeakHold = !g_EnablePeakHold;
@@ -1419,9 +1498,10 @@ static void toggleFSK() {
         memset(&g_TapeStats, 0, sizeof(g_TapeStats));
         g_TapeStats.currentSide = 'A';
         g_CurrentLineIdx = 0;
-        // Ensure standard Bell 202 frequencies
-        g_Modem.cfg.freqMark = 1200.0f;
-        g_Modem.cfg.freqSpace = 2200.0f;
+        // Proportional frequency scaling for shifted audio (Reference: 1200 baud = 1200/2200 Hz)
+        float scale = g_BaudRate / 1200.0f;
+        g_Modem.cfg.freqMark = 1200.0f * scale;
+        g_Modem.cfg.freqSpace = 2200.0f * scale;
         g_Modem.cfg.baudRate = g_BaudRate;
         g_Modem.cfg.sampleRate = 12000.0f;
         g_Modem.cfg.noiseFloor = 0.2f; // Matched to reference (20% signal)
@@ -1478,11 +1558,14 @@ static uint32_t Color565ToARGB(uint16_t rgb565) {
     uint32_t r = (rgb565 >> 11) & 0x1F; uint32_t g = (rgb565 >> 5) & 0x3F; uint32_t b = rgb565 & 0x1F;
     return 0xFF000000 | (((r*255)/31) << 16) | (((g*255)/63) << 8) | ((b*255)/31);
 }
-
 static void cycleBaudRate(void) {
-    g_BaudRate += 100.0f;
-    if (g_BaudRate > 1400.0f) g_BaudRate = 1000.0f;
+    g_BaudIdx = (g_BaudIdx + 1) % 5;
+    g_BaudRate = g_BaudRates[g_BaudIdx];
     
+    // Scale frequencies proportionally to the baud rate (Reference: 1200 baud = 1200/2200 Hz)
+    float scale = g_BaudRate / 1200.0f;
+    g_Modem.cfg.freqMark = 1200.0f * scale;
+    g_Modem.cfg.freqSpace = 2200.0f * scale;
     g_Modem.cfg.baudRate = g_BaudRate;
     g_Modem.cfg.baudCorrection = g_BaudCorrectionFactor;
     FSK_Init(&g_Modem, g_Modem.cfg);
