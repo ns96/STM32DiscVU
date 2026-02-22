@@ -30,7 +30,7 @@
 #include "stm32746g_discovery_lcd.h"
 #include "stm32746g_discovery_sdram.h"
 #include <math.h>
-#include "FSKDecoder.h"
+#include "FSKModem.h"
 #include "VisualizerApp.h"
 /* USER CODE END Includes */
 
@@ -1710,18 +1710,40 @@ static void Audio_Bridge_Process(int16_t* inBuf, uint32_t samples) {
     SCB_InvalidateDCache_by_Addr((uint32_t*)inBuf, samples * 2);
 
 
-    uint32_t numStereoSamples = samples / 2;
-    uint32_t numModemSteps = numStereoSamples / 4;
+    uint32_t step = 4; // TDM frame is always 4 slots
+    uint32_t numModemSteps = samples / (step * 4); // 4-decimation for modem speed
     
     for (uint32_t i = 0; i < numModemSteps; i++) {
         float sumM = 0;
         for(int j=0; j<4; j++) {
-            int baseIdx = (i*4 + j) * 2;
-            sumM += (float)inBuf[baseIdx] + (float)inBuf[baseIdx + 1];
+            int baseIdx = (i*4 + j) * step;
+            extern bool g_InputLineIn;
+            if (g_InputLineIn) {
+                // Slots 0 & 1 (Line In)
+                sumM += (float)inBuf[baseIdx] + (float)inBuf[baseIdx+1];
+            } else {
+                // Slots 2 & 3 (Mic)
+                sumM += (float)inBuf[baseIdx+2] + (float)inBuf[baseIdx+3];
+            }
         }
+        // Average: 2 channels * 4 decimation steps = 8.0f
         float monoAvg = (sumM / 8.0f) / 32768.0f;
         
-        // DC Removal
+        // Loopback: If encoding, override the BRIDGE input with the internal playback signal
+        // This ensures the RX modem (waterfall/carrier) "hears" the encoded signal.
+        if (g_IsEncoding) {
+             float sumL = 0;
+             // Determine if we are processing the first or second half of the audio buffer
+             // and point to the corresponding half of the playback buffer.
+             int16_t* pOutBase = (inBuf < &audio_buffer[AUDIO_BUFFER_SIZE/2]) ? &playback_buffer[0] : &playback_buffer[AUDIO_BUFFER_SIZE/2];
+             for(int j=0; j<4; j++) {
+                 int baseIdx = (i*4 + j) * step; 
+                 // FSK is duplicated on all slots in the playback buffer, reading 0 and 1 is sufficient
+                 sumL += (float)pOutBase[baseIdx] + (float)pOutBase[baseIdx+1];
+             }
+             monoAvg = (sumL / 8.0f) / 32768.0f;
+        }
+
         fsk_dc = 0.999f * fsk_dc + 0.001f * monoAvg;
         float cleanAvg = monoAvg - fsk_dc;
         
@@ -1752,19 +1774,105 @@ static void Audio_Bridge_Process(int16_t* inBuf, uint32_t samples) {
 }
 
 void BSP_AUDIO_IN_TransferComplete_CallBack(void) {
-    memcpy(&playback_buffer[AUDIO_BUFFER_SIZE / 2], &audio_buffer[AUDIO_BUFFER_SIZE / 2], AUDIO_BUFFER_SIZE); // copy in half-buffer size in bytes
+    // 1. Invalidate input buffer so CPU sees what DMA wrote
+    SCB_InvalidateDCache_by_Addr((uint32_t*)&audio_buffer[AUDIO_BUFFER_SIZE / 2], AUDIO_BUFFER_SIZE);
+
+    if (g_IsEncoding) {
+        int16_t* pOut = &playback_buffer[AUDIO_BUFFER_SIZE / 2];
+        // 4nd-Slot Duplication: Fill all 4 slots with signal
+        // This ensures the audio reaches the codec regardless of slot mapping
+        for (int i = 0; i < AUDIO_BUFFER_SIZE / 2; i += 4) {
+            int16_t sample = FSK_FIFO_Pop();
+            pOut[i]   = sample; // Slot 0
+            pOut[i+1] = sample; // Slot 1
+            pOut[i+2] = sample; // Slot 2
+            pOut[i+3] = sample; // Slot 3
+        }
+        
+        static uint32_t lastDbgTC = 0;
+        if (HAL_GetTick() - lastDbgTC > 1000) {
+            lastDbgTC = HAL_GetTick();
+            printf("[IRQ] TC Encoding Active (FIFO Sample: %d)\n", pOut[0]);
+            // Re-assert volume/unmute once per second just in case
+            BSP_AUDIO_OUT_SetVolume(90);
+            BSP_AUDIO_OUT_SetMute(AUDIO_MUTE_OFF);
+        }
+    } else {
+        extern bool g_InputLineIn;
+        int16_t* pIn = &audio_buffer[AUDIO_BUFFER_SIZE / 2];
+        int16_t* pOut = &playback_buffer[AUDIO_BUFFER_SIZE / 2];
+        for (int i = 0; i < AUDIO_BUFFER_SIZE / 2; i += 4) {
+             int16_t srcL = g_InputLineIn ? pIn[i]   : pIn[i+2];
+             int16_t srcR = g_InputLineIn ? pIn[i+1] : pIn[i+3];
+
+             // Digital Monitor Attenuation (-26dB pad)
+             // The FSK decoder requires the loud +30dB analog hardware gain, which 
+             // unfortunately digitizes the ADC's thermal noise floor as loud hiss.
+             // By attenuating the headphone passthrough by 95%, we push the hiss
+             // into total silence, while still letting the user monitor the loud FSK tones.
+             if (g_InputLineIn) {
+                 srcL = (int16_t)((float)srcL * 0.05f);
+                 srcR = (int16_t)((float)srcR * 0.05f);
+             }
+
+             pOut[i]   = srcL;
+             pOut[i+1] = srcR;
+             pOut[i+2] = srcL;
+             pOut[i+3] = srcR;
+        }
+    }
+    
+    // 2. Clean playback buffer so DMA sees what CPU wrote
     SCB_CleanDCache_by_Addr((uint32_t*)&playback_buffer[AUDIO_BUFFER_SIZE / 2], AUDIO_BUFFER_SIZE);
     
     Audio_Bridge_Process(&audio_buffer[AUDIO_BUFFER_SIZE / 2], AUDIO_BUFFER_SIZE / 2);
-    audio_ready |= 1; // Mark second half ready
+    audio_ready |= 1; 
 }
 
 void BSP_AUDIO_IN_HalfTransfer_CallBack(void) {
-    memcpy(&playback_buffer[0], &audio_buffer[0], AUDIO_BUFFER_SIZE); // copy in half-buffer size in bytes
+    // 1. Invalidate input buffer so CPU sees what DMA wrote
+    SCB_InvalidateDCache_by_Addr((uint32_t*)&audio_buffer[0], AUDIO_BUFFER_SIZE);
+
+    if (g_IsEncoding) {
+        int16_t* pOut = &playback_buffer[0];
+        // 4nd-Slot Duplication: Fill all 4 slots with signal
+        for (int i = 0; i < AUDIO_BUFFER_SIZE / 2; i += 4) {
+            int16_t sample = FSK_FIFO_Pop();
+            pOut[i]   = sample; 
+            pOut[i+1] = sample; 
+            pOut[i+2] = sample; 
+            pOut[i+3] = sample; 
+        }
+    } else {
+        extern bool g_InputLineIn;
+        int16_t* pIn = &audio_buffer[0];
+        int16_t* pOut = &playback_buffer[0];
+        for (int i = 0; i < AUDIO_BUFFER_SIZE / 2; i += 4) {
+             int16_t srcL = g_InputLineIn ? pIn[i]   : pIn[i+2];
+             int16_t srcR = g_InputLineIn ? pIn[i+1] : pIn[i+3];
+
+             // Digital Monitor Attenuation (-26dB pad)
+             // The FSK decoder requires the loud +30dB analog hardware gain, which 
+             // unfortunately digitizes the ADC's thermal noise floor as loud hiss.
+             // By attenuating the headphone passthrough by 95%, we push the hiss
+             // into total silence, while still letting the user monitor the loud FSK tones.
+             if (g_InputLineIn) {
+                 srcL = (int16_t)((float)srcL * 0.05f);
+                 srcR = (int16_t)((float)srcR * 0.05f);
+             }
+
+             pOut[i]   = srcL;
+             pOut[i+1] = srcR;
+             pOut[i+2] = srcL;
+             pOut[i+3] = srcR;
+        }
+    }
+    
+    // 2. Clean playback buffer so DMA sees what CPU wrote
     SCB_CleanDCache_by_Addr((uint32_t*)&playback_buffer[0], AUDIO_BUFFER_SIZE);
 
     Audio_Bridge_Process(&audio_buffer[0], AUDIO_BUFFER_SIZE / 2);
-    audio_ready |= 2; // Mark first half ready
+    audio_ready |= 2; 
 }
 
 void BSP_AUDIO_IN_Error_CallBack(void) {
@@ -1782,7 +1890,7 @@ void StartModemTask(void const * argument) {
     // Explicit Init here in the task context
     extern float g_BaudCorrectionFactor;
     FSK_Config fskCfg = {1200.0f, 2200.0f, 1200.0f, 12000.0f, 0.1f, g_BaudCorrectionFactor, false};
-    FSK_Init(&g_Modem, fskCfg);
+    FSK_Modem_Init(&g_Modem, fskCfg);
     
     bool lastCarrier = false;
     for(;;) {
@@ -1791,14 +1899,21 @@ void StartModemTask(void const * argument) {
             static uint32_t last_rx_debug = 0;
             if (HAL_GetTick() - last_rx_debug > 2000) {
                  float pwr = 0.0f;
-                 for(int k=0; k<MODEM_CHUNK_SIZE; k++) pwr += fabsf(rxChunk.samples[k]);
-                 printf("[MODEM] Rx Chunk OK. AvgPwr: %.4f | Carrier: %d\r\n", pwr/64.0f, g_Modem.carrier);
+                 for(int k=0; k<MODEM_CHUNK_SIZE; k++) {
+                     float v = rxChunk.samples[k];
+                     pwr += (v > 0 ? v : -v);
+                 }
+                 int scaledPwr = (int)(pwr * 1000.0f / 64.0f);
+                 int scaledSNR = (int)(g_Modem.lastSNR * 10.0f);
+                 printf("[MODEM] Chunk Rx OK. Pwr:%d SNR:%d.%d Carr:%d\r\n", 
+                        scaledPwr, scaledSNR/10, scaledSNR%10, g_Modem.carrier);
                  last_rx_debug = HAL_GetTick();
             }
 
-            if (g_ShowFSK) {
+            extern volatile bool g_IsEncoding;
+            if (g_ShowFSK && !g_IsEncoding) {
                 for (int i = 0; i < MODEM_CHUNK_SIZE; i++) {
-                    char c = FSK_Process(&g_Modem, rxChunk.samples[i]);
+                    char c = FSK_Modem_ProcessRX(&g_Modem, rxChunk.samples[i]);
                     if (c) addFSKChar(c);
                     
                     if (lastCarrier && !g_Modem.carrier) {
@@ -1808,7 +1923,7 @@ void StartModemTask(void const * argument) {
                     lastCarrier = g_Modem.carrier;
                 }
             } else {
-                lastCarrier = false; // Reset if FSK is hidden
+                lastCarrier = false; // Reset if FSK is hidden OR encoding is active
             }
         }
     }
@@ -1858,13 +1973,16 @@ void StartDefaultTask(void const * argument)
         last_heartbeat = HAL_GetTick();
     }
 
+    extern volatile bool g_IsEncoding;
     if (audio_ready & 2) { // First Half (HT)
         audio_ready &= ~2;
-        Visualizer_ProcessAudio(&audio_buffer[0], AUDIO_BUFFER_SIZE/2);
+        int16_t* pBuf = g_IsEncoding ? &playback_buffer[0] : &audio_buffer[0];
+        Visualizer_ProcessAudio(pBuf, AUDIO_BUFFER_SIZE/2);
     }
     if (audio_ready & 1) { // Second Half (TC)
         audio_ready &= ~1;
-        Visualizer_ProcessAudio(&audio_buffer[AUDIO_BUFFER_SIZE/2], AUDIO_BUFFER_SIZE/2);
+        int16_t* pBuf = g_IsEncoding ? &playback_buffer[AUDIO_BUFFER_SIZE/2] : &audio_buffer[AUDIO_BUFFER_SIZE/2];
+        Visualizer_ProcessAudio(pBuf, AUDIO_BUFFER_SIZE/2);
     }
     
     static uint32_t last_update = 0;
@@ -1875,7 +1993,7 @@ void StartDefaultTask(void const * argument)
 
     Visualizer_Update();
     
-    osDelay(1);
+    osDelay(10); // Aggressively reduce CPU load
   }
   /* USER CODE END 5 */
 }

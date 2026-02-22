@@ -1,16 +1,16 @@
 /*
- * FSKDecoder.h
- * Ported from JMinimodem / ModemDSP (C++) to C
+ * FSKModem.h
+ * Unified FSK Decoder and Encoder
  */
 
-#ifndef FSK_DECODER_H
-#define FSK_DECODER_H
+#ifndef FSK_MODEM_H
+#define FSK_MODEM_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
 
-#define FSK_MAX_FILTER_SIZE 100 // Sufficient for 48kHz / 1200 baud -> 40 samples
+#define FSK_MAX_FILTER_SIZE 100 
 
 typedef struct {
     float freqMark;
@@ -18,7 +18,7 @@ typedef struct {
     float baudRate;
     float sampleRate;
     float noiseFloor;
-    float baudCorrection; // Scale factor (e.g. 1.05 for 5% speed increase)
+    float baudCorrection; 
     bool invert;
 } FSK_Config;
 
@@ -51,14 +51,20 @@ typedef struct {
     float lastSNR;
     float samplesPerBit;
     
-    // Tape Speed Diagnostic (Transition-based)
+    // TX State
+    float txPhase;
+    float txSampleAccum;
+    
+    // Diagnostics
     uint32_t sampleCount;
     uint32_t lastEdgeSample;
     float lastMeasuredBaud;
 } FSK_Modem;
 
-void FSK_Init(FSK_Modem* modem, FSK_Config cfg);
-char FSK_Process(FSK_Modem* modem, float sample);
+void FSK_Modem_Init(FSK_Modem* m, FSK_Config cfg);
+char FSK_Modem_ProcessRX(FSK_Modem* m, float sample);
+size_t FSK_Modem_GenerateTX(FSK_Modem* m, const char* text, int16_t* buffer, size_t max_samples);
 float Filter_GetMag(FSK_SlidingFilter* f);
+int16_t FSK_GetSineSample(uint8_t phaseIdx);
 
-#endif // FSK_DECODER_H
+#endif // FSK_MODEM_H

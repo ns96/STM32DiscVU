@@ -190,9 +190,9 @@ uint32_t wm8994_Init(uint16_t DeviceAddr, uint16_t OutputInputDevice, uint8_t Vo
       break;
 
     case OUTPUT_DEVICE_HEADPHONE:
-      /* Disable DAC1 (Left), Disable DAC1 (Right),
-      Enable DAC2 (Left), Enable DAC2 (Right)*/
-      counter += CODEC_IO_Write(DeviceAddr, 0x05, 0x0303);
+      /* Enable DAC1 (Left), Enable DAC1 (Right),
+      Disable DAC2 (Left), Disable DAC2 (Right)*/
+      counter += CODEC_IO_Write(DeviceAddr, 0x05, 0x0C0C);
 
       /* Enable the AIF1 Timeslot 0 (Left) to DAC 1 (Left) mixer path */
       counter += CODEC_IO_Write(DeviceAddr, 0x601, 0x0001);
@@ -343,7 +343,7 @@ uint32_t wm8994_Init(uint16_t DeviceAddr, uint16_t OutputInputDevice, uint8_t Vo
       counter += CODEC_IO_Write(DeviceAddr, 0x440, 0x00DB);
 
       /* Disable IN1L, IN1R, IN2L, IN2R, Enable Thermal sensor & shutdown */
-      counter += CODEC_IO_Write(DeviceAddr, 0x02, 0x6350);
+      counter += CODEC_IO_Write(DeviceAddr, 0x02, 0x6000);
 
       /* Enable the DMIC2(Left) to AIF1 Timeslot 0 (Left) mixer path */
       counter += CODEC_IO_Write(DeviceAddr, 0x606, 0x0002);
@@ -366,8 +366,8 @@ uint32_t wm8994_Init(uint16_t DeviceAddr, uint16_t OutputInputDevice, uint8_t Vo
       /* Enable AIF1 DRC2 Signal Detect & DRC in AIF1ADC1 Left/Right Timeslot 0 */
       counter += CODEC_IO_Write(DeviceAddr, 0x440, 0x00DB);
 
-      /* Disable IN1L, IN1R, Enable IN2L, IN2R, Thermal sensor & shutdown */
-      counter += CODEC_IO_Write(DeviceAddr, 0x02, 0x63A0);
+      /* Disable IN1L, IN1R, IN2L, IN2R, Enable Thermal sensor & shutdown */
+      counter += CODEC_IO_Write(DeviceAddr, 0x02, 0x6000);
 
       /* Enable the DMIC2(Left) to AIF1 Timeslot 0 (Left) mixer path */
       counter += CODEC_IO_Write(DeviceAddr, 0x606, 0x0002);

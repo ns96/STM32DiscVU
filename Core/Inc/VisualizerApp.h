@@ -42,15 +42,26 @@ typedef struct {
 // Global State
 extern bool g_ShowVUMeter;
 extern bool g_ShowWaterfall;
-extern bool g_SimulationMode; // Changed from int to bool
+extern bool g_ShowSpectrum;
+extern bool g_ShowFSK;
+extern bool g_ShowFSKEncode;
+extern bool g_SimulationMode; 
 extern bool g_InputLineIn;
+extern volatile bool g_IsEncoding;
 
 // Audio context needed for switching inputs
 extern int16_t audio_buffer[AUDIO_BUFFER_SIZE];
 
 // API
 void Visualizer_Init(void);
-void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples);
 void Visualizer_Update(void);
+void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples);
+void FSK_Reset_Buffering_State(void);
+void addFSKDisplayString(const char* str);
+
+// FSK FIFO
+void FSK_FIFO_Push(int16_t sample);
+int16_t FSK_FIFO_Pop(void);
+void FSK_FIFO_Reset(void);
 
 #endif // VISUALIZER_APP_H

@@ -1,6 +1,6 @@
 #include "VisualizerApp.h"
 #include "SimpleFFT.h"
-#include "FSKDecoder.h"
+#include "FSKModem.h"
 #include "DatabaseManager.h"
 #include "heat565.h"
 #include "stm32746g_discovery_lcd.h"
@@ -152,11 +152,38 @@ static bool GetMappedRecord(char side, int totalTime, char* outHash, char* outFu
 }
 
 // --- FSK Debug & Config ---
-static float g_BaudRates[] = {300.0f, 600.0f, 1100.0f, 1200.0f, 1300.0f};
-static int g_BaudIdx = 3; // Default to 1200
+static float g_BaudRates[] = {300.0f, 600.0f, 1200.0f};
+static int g_BaudIdx = 2; // Default to 1200
 static float g_BaudRate = 1200.0f;
 static uint32_t g_LastDebugTime = 0;
 float g_MaxSignalLevel = 0.0f;
+
+// --- FSK Audio Output FIFO ---
+#define FSK_FIFO_SIZE 131072
+// Map the colossal 262KB FIFO to unused external SDRAM at 0xC0300000 to save internal SRAM
+#define g_FSK_FIFO ((int16_t*)0xC0300000)
+static volatile uint32_t g_FSK_FIFO_ReadIdx = 0;
+static volatile uint32_t g_FSK_FIFO_WriteIdx = 0;
+
+void FSK_FIFO_Push(int16_t sample) {
+    uint32_t next = (g_FSK_FIFO_WriteIdx + 1) % FSK_FIFO_SIZE;
+    if (next != g_FSK_FIFO_ReadIdx) {
+        g_FSK_FIFO[g_FSK_FIFO_WriteIdx] = sample;
+        g_FSK_FIFO_WriteIdx = next;
+    }
+}
+
+int16_t FSK_FIFO_Pop(void) {
+    if (g_FSK_FIFO_ReadIdx == g_FSK_FIFO_WriteIdx) return 0;
+    int16_t sample = g_FSK_FIFO[g_FSK_FIFO_ReadIdx];
+    g_FSK_FIFO_ReadIdx = (g_FSK_FIFO_ReadIdx + 1) % FSK_FIFO_SIZE;
+    return sample;
+}
+
+void FSK_FIFO_Reset(void) {
+    g_FSK_FIFO_ReadIdx = 0;
+    g_FSK_FIFO_WriteIdx = 0;
+}
 
 void addFSKChar(char c);
 void addFSKDisplayChar(char c);
@@ -178,7 +205,16 @@ bool g_SimulationMode = true;
 bool g_InputLineIn = false;
 bool g_EnablePeakHold = true;
 bool g_ShowFSK = false;
+bool g_ShowFSKEncode = false;
+char g_EncodeSide = 'A';
+int g_EncodeDuration = 45;
+volatile bool g_IsEncoding = false;
+int g_EncodeSeconds = 0;
+uint32_t g_LastEncodeTick = 0;
+FSK_Modem g_TxModem;
 int g_SpectrumMode = 0;
+static const int splitX = 240;
+static void UpdateFSKEncode(void);
 
 // --- Spectrum Colors (Customizable) ---
 #define COLOR_SPEC_L  LCD_COLOR_YELLOW
@@ -564,6 +600,7 @@ static void drawSpectrum(void);
 static void drawVU(void);
 static void drawWaterfall(void);
 static void cycleBaudRate(void);
+static void initFSKModems(void); // New helper to sync both
 static void initButtons(void);
 static void handleTouch(void);
 static void toggleSpectrum(void);
@@ -577,6 +614,29 @@ static void drawFSKText(void);
 static void Visualizer_InitAudio(void);
 static uint32_t Color565ToARGB(uint16_t rgb565);
 static void FillRectDMA2D(uint32_t* fb, int x, int y, int w, int h, uint32_t color);
+
+static uint32_t heatARGB[256];
+
+static void initSpectrumLUT(void) {
+    for (int i = 0; i < 256; i++) {
+        heatARGB[i] = Color565ToARGB(heat565[i]);
+    }
+}
+
+static void FillRectCPU(uint32_t* fb, int x, int y, int w, int h, uint32_t color) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > 480) w = 480 - x;
+    if (y + h > 272) h = 272 - y;
+    if (w <= 0 || h <= 0) return;
+
+    for (int py = 0; py < h; py++) {
+        uint32_t* row = &fb[(y + py) * 480 + x];
+        for (int px = 0; px < w; px++) {
+            row[px] = color;
+        }
+    }
+}
 
 // --- Initialization ---
 void Visualizer_Init(void) {
@@ -598,11 +658,15 @@ void Visualizer_Init(void) {
     status = BSP_TS_Init(BSP_LCD_GetXSize(), BSP_LCD_GetYSize());
     ts_enabled = (status == TS_OK);
     
-    // FSK Decoder initialization moved to StartModemTask in main.c
-    printf("VisualizerApp: FSK Decoder ready (background task)...\r\n");
+    // FSK Modems initialization: Force default to 1200 baud
+    g_BaudIdx = 2;
+    g_BaudRate = 1200.0f;
+    initFSKModems();
+    printf("VisualizerApp: FSK Decoder ready (1200 Baud)...\r\n");
     
     printf("VisualizerApp: Clearing Waterfall Buffer in SDRAM...\r\n");
     initWaterfallLUT(); // CRITICAL: Restore LUT initialization
+    initSpectrumLUT();  // Precompute spectrum ARGB colors
     uint32_t bgColor = wfall_lut[0];
     uint32_t* ptr = (uint32_t*)WFALL_FB_ADDRESS;
     for(int i=0; i<WFALL_WIDTH * WFALL_HEIGHT; i++) ptr[i] = bgColor;
@@ -676,9 +740,11 @@ void Visualizer_Init(void) {
 }
 
 void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
-    if (g_SimulationMode) return;
+    extern volatile bool g_IsEncoding;
+    if (g_IsEncoding) g_SimulationMode = false; // Force real view during encoding
+    if (g_SimulationMode && !g_IsEncoding) return;
 
-    SCB_InvalidateDCache_by_Addr((uint32_t*)inBuf, samples * 2);
+    // Cache management is handled by the caller (main.c)
 
 // 1. FSK Processing moved to StartModemTask in main.c
 
@@ -687,44 +753,41 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
         g_LastDebugTime = HAL_GetTick();
         // FSK DIAGNOSTICS (moved from interrupt context)
         if (g_ShowFSK) {
-            // Get raw filter magnitudes for analysis
-            float mMag = Filter_GetMag(&g_Modem.filterMark);
-            float sMag = Filter_GetMag(&g_Modem.filterSpace);
-            
-            // Use integer scaling (x100) to avoid float-printf issues on STM32
-            printf("[FSK DIAG] Baud:%d | Signal:%d%% | M:%d S:%d | SNR:%d | Carr:%d\r\n", 
-                   (int)g_Modem.cfg.baudRate, 
-                   (int)(g_MaxSignalLevel * 100.0f), 
-                   (int)(mMag * 100.0f), (int)(sMag * 100.0f),
-                   (int)(g_Modem.lastSNR * 100.0f), 
-                   g_Modem.carrier);
+            // FSK Diagnostics could be added here using public members like g_Modem.lastSNR
+            // printf("[FSK] SNR: %d.%02d\n", (int)g_Modem.lastSNR, (int)(g_Modem.lastSNR * 100) % 100);
         }
         g_MaxSignalLevel = 0.0f; // Reset peak hold
     }
 
     // 2. Full-Sample VU Energy Detection (Raw 48kHz RMS Scan)
-    // This provides a stable power measurement for FSK sine waves.
+    // Handle 4-slot TDM (I2S alignment on STM32)
+    // Left channel occupies the first half of the frame (Slots 0 and 1 = indices i, i+1)
+    // Right channel occupies the second half of the frame (Slots 2 and 3 = indices i+2, i+3)
+    // LineIn uses Slots 0 and 2. Mic2 uses Slots 1 and 3. Summing them handles either source seamlessly.
+    uint32_t step = 4;
     float sumSqL = 0, sumSqR = 0;
-    for (uint32_t i = 0; i < samples; i += 2) {
-        float sL = (float)inBuf[i] / 32768.0f;
-        float sR = (float)inBuf[i + 1] / 32768.0f;
+    for (uint32_t i = 0; i < samples; i += step) {
+        float sL = ((float)inBuf[i] + (float)inBuf[i + 1]) / 32768.0f;
+        float sR = ((float)inBuf[i + 2] + (float)inBuf[i + 3]) / 32768.0f;
         sumSqL += sL * sL;
         sumSqR += sR * sR;
     }
     
     // Instant Attack for RMS (with gain alignment)
-    float instantRmsL = sqrtf(sumSqL / (samples / 2)) * g_AudioGain;
-    float instantRmsR = sqrtf(sumSqR / (samples / 2)) * g_AudioGain;
+    uint32_t numFrames = samples / step;
+    float currentGain = g_IsEncoding ? 1.0f : g_AudioGain;
+    float instantRmsL = sqrtf(sumSqL / numFrames) * currentGain;
+    float instantRmsR = sqrtf(sumSqR / numFrames) * currentGain;
     
     if (instantRmsL > peakL) peakL = instantRmsL;
     if (instantRmsR > peakR) peakR = instantRmsR;
 
     // 3. Process decimated stream for FFT
-    for (uint32_t i = 0; i < samples; i += 2 * RX_DECIMATION) {
+    for (uint32_t i = 0; i < samples; i += step * RX_DECIMATION) {
         int32_t sumL = 0, sumR = 0;
         for (int j = 0; j < RX_DECIMATION; j++) {
-            sumL += inBuf[i + j * 2];
-            sumR += inBuf[i + j * 2 + 1];
+            sumL += inBuf[i + j * step] + inBuf[i + j * step + 1];
+            sumR += inBuf[i + j * step + 2] + inBuf[i + j * step + 3];
         }
         
         float rawL = (float)(sumL / RX_DECIMATION) / 32768.0f;
@@ -738,8 +801,8 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
         if (fftIdx < FFT_SIZE) {
             vReal[fftIdx] = clean;
             vImag[fftIdx] = 0.0f;
-            vRealL[fftIdx] = rawL * g_AudioGain;
-            vRealR[fftIdx] = rawR * g_AudioGain;
+            vRealL[fftIdx] = rawL * currentGain;
+            vRealR[fftIdx] = rawR * currentGain;
             fftIdx++;
         }
     }
@@ -747,6 +810,8 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
 
 void Visualizer_Update(void) {
     handleTouch();
+    osDelay(5); // Reduce CPU load
+    UpdateFSKEncode(); // Background encoding (even if panel hidden)
     
     int back_idx = 1 - front_buffer_idx;
     uint32_t back_addr = fb_addresses[back_idx];
@@ -944,6 +1009,9 @@ static void drawSpectrum() {
     int bottomY = UI_VIZ_BOTTOM; int maxH = UI_VIZ_BOTTOM - UI_VIZ_TOP;
     uint32_t* back_fb = (uint32_t*)hLtdcHandler.LayerCfg[0].FBStartAdress;
     
+    // WAIT for DMA2D background clear to finish before CPU starts drawing arrays over it
+    while (hdma2d.Instance->CR & DMA2D_CR_START);
+    
     if (g_SpectrumMode == 1) {
         // --- 31/31 ISO Standard Stereo Split ---
         int barW = 7; 
@@ -961,7 +1029,7 @@ static void drawSpectrum() {
             if (g_EnablePeakHold) {
                 if ((float)hL >= g_SpectrumPeaks[i]) { g_SpectrumPeaks[i] = (float)hL; g_PeakHoldCount[i] = g_PeakHoldFrames; }
             }
-            FillRectDMA2D(back_fb, leftX + i*barW, bottomY - hL, barW-1, hL, COLOR_SPEC_L);
+            FillRectCPU(back_fb, leftX + i*barW, bottomY - hL, barW-1, hL, COLOR_SPEC_L);
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
@@ -977,7 +1045,7 @@ static void drawSpectrum() {
             if (g_EnablePeakHold) {
                 if ((float)hR >= g_SpectrumPeaks[rIdx]) { g_SpectrumPeaks[rIdx] = (float)hR; g_PeakHoldCount[rIdx] = g_PeakHoldFrames; }
             }
-            FillRectDMA2D(back_fb, rightX + i*barW, bottomY - hR, barW-1, hR, COLOR_SPEC_R);
+            FillRectCPU(back_fb, rightX + i*barW, bottomY - hR, barW-1, hR, COLOR_SPEC_R);
              if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[rIdx];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
@@ -1012,7 +1080,7 @@ static void drawSpectrum() {
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
                 
-                FillRectDMA2D(back_fb, startX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                FillRectCPU(back_fb, startX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
 
             if (g_EnablePeakHold) {
@@ -1057,7 +1125,7 @@ static void drawSpectrum() {
                 if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
-                FillRectDMA2D(back_fb, leftX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                FillRectCPU(back_fb, leftX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
@@ -1086,7 +1154,7 @@ static void drawSpectrum() {
                 if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
-                FillRectDMA2D(back_fb, rightX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                FillRectCPU(back_fb, rightX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[rIdx];
@@ -1115,8 +1183,8 @@ static void drawSpectrum() {
                 if ((float)h >= g_SpectrumPeaks[i]) { g_SpectrumPeaks[i] = (float)h; g_PeakHoldCount[i] = g_PeakHoldFrames; }
             }
 
-            uint32_t barColor = Color565ToARGB(heat565[i*4%256]);
-            FillRectDMA2D(back_fb, startX + i*barW, bottomY - h, barW-1, h, barColor);
+            uint32_t barColor = heatARGB[i*4%256];
+            FillRectCPU(back_fb, startX + i*barW, bottomY - h, barW-1, h, barColor);
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
@@ -1180,7 +1248,8 @@ static void drawWaterfall() {
 }
 
 static void drawVU() {
-    int w = 400; int h = 12; int x = 40;
+    int w = g_ShowFSKEncode ? 200 : 400; 
+    int h = 12; int x = 40;
     int yL = UI_HEADER_H + 5; int yR = UI_HEADER_H + 20;
 
     // Logarithmic (dB) Scaling for "Sensitive" Meters
@@ -1242,6 +1311,66 @@ static void drawVU() {
     }
 }
 
+// --- FSK Buffering State Reset ---
+// This ensures that when encoding starts, we immediately buffer Sec 0
+static uint32_t g_lastGenSec = 0xFFFFFFFF;
+void FSK_Reset_Buffering_State(void) {
+    g_lastGenSec = 0xFFFFFFFF;
+    // Also clear the FIFO to prevent stale audio from previous runs
+    g_FSK_FIFO_ReadIdx = 0;
+    g_FSK_FIFO_WriteIdx = 0;
+}
+
+static void UpdateFSKEncode(void) {
+    if (!g_IsEncoding) return;
+    
+    // Auto-Stop Check
+    if (g_EncodeSeconds >= g_EncodeDuration * 60) {
+        g_IsEncoding = false;
+        addFSKDisplayString("\n### ENCODING COMPLETE\n");
+        return;
+    }
+
+    // Update real-time clock for UI display
+    uint32_t now = HAL_GetTick();
+    if (now - g_LastEncodeTick >= 1000) {
+        g_LastEncodeTick = now;
+        g_EncodeSeconds++;
+    }
+
+    // FIFO Management: Buffer ahead
+    uint32_t used = (g_FSK_FIFO_WriteIdx >= g_FSK_FIFO_ReadIdx) ? 
+                    (g_FSK_FIFO_WriteIdx - g_FSK_FIFO_ReadIdx) :
+                    (FSK_FIFO_SIZE - (g_FSK_FIFO_ReadIdx - g_FSK_FIFO_WriteIdx));
+    
+    // Fill the buffer when we have at least 66000 empty spots in the FIFO
+    // A 1-second block at 300 baud is roughly 49600 samples.
+    if (used <= (FSK_FIFO_SIZE - 66000)) {
+        uint32_t secToGen;
+        if (g_lastGenSec == 0xFFFFFFFF) secToGen = 0; // START AT ZERO
+        else secToGen = g_lastGenSec + 1;
+        
+        if (secToGen < g_EncodeDuration * 60) {
+            g_lastGenSec = secToGen;
+            
+            char dctBuf[48];
+            snprintf(dctBuf, sizeof(dctBuf), "DCT0%c_01_aaaaaaaaaa_%04d_%04d\n", g_EncodeSide, (int)secToGen, (int)secToGen);
+            addFSKDisplayString(dctBuf);
+            
+            // 65536 is absolutely required to prevent buffer truncation at 300 baud!
+            // Map the colossal 131KB temporary block generator to unused external SDRAM at 0xC0380000
+            int16_t* txBuf = (int16_t*)0xC0380000; 
+            size_t samplesGenerated = FSK_Modem_GenerateTX(&g_TxModem, dctBuf, txBuf, 65536);
+            if (samplesGenerated > 0) {
+                for(size_t i=0; i<samplesGenerated; i++) {
+                    FSK_FIFO_Push(txBuf[i]);
+                }
+                printf("FSK: Buffered %d samples for Sec %d\n", (int)samplesGenerated, (int)secToGen);
+            }
+        }
+    }
+}
+
 static void drawFSKText(void) {
     BSP_LCD_SetTextColor(LCD_COLOR_DARKGREEN);
     BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
@@ -1258,7 +1387,6 @@ static void drawFSKText(void) {
     int lineHeight = 12;
     
     // Split screen logic: FSK Log on left (0-240), Stats on right (240-480)
-    int splitX = 240;
     int wrapCount = 34; // Adjusted for Font12 (7px wide, 240/7 = 34)
 
     // Draw Vertical Separator
@@ -1332,92 +1460,152 @@ static void drawFSKText(void) {
         y += lineHeight;
     }
 
-    // --- Right Side: TapeStats ---
-    // BSP_LCD_SetFont(&Font12); // Already set above
+    // --- Right Side: TapeStats or FSK Encode Panel ---
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
     y = startY;
     int statsX = splitX + 10;
-    char sBuf[64];
     
-    int snrInt = (int)g_Modem.lastSNR;
-    int snrDec = (int)((g_Modem.lastSNR - snrInt) * 100);
-    if(snrDec < 0) snrDec = -snrDec;
-    
-    // Speed Offset Calculation
-    float speedOffset = 0;
-    if (g_Modem.lastMeasuredBaud > 0) {
-        speedOffset = (g_Modem.lastMeasuredBaud - g_BaudRate) * 100.0f / g_BaudRate;
-    }
-    int offInt = (int)speedOffset;
-    int offDec = (int)((speedOffset - offInt) * 10);
-    if(offDec < 0) offDec = -offDec;
-    if(offInt < 0) offInt = -offInt; // Fix: Remove embedded minus sign for snprintf
-    char sign = (speedOffset >= 0) ? '+' : '-';
-
-    snprintf(sBuf, sizeof(sBuf), "Baud: %d (%c%d.%d%%) | SNR: %d.%02d", 
-             (int)g_Modem.lastMeasuredBaud, sign, (int)offInt, (int)offDec, (int)snrInt, (int)snrDec);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
-
-    snprintf(sBuf, sizeof(sBuf), "Side: %c | Stops: %d", g_TapeStats.currentSide, g_TapeStats.totalStops);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
-
-    snprintf(sBuf, sizeof(sBuf), "Mode: %s", g_TapeStats.isDctMode ? "DCT" : "Generic");
-    BSP_LCD_SetTextColor(g_TapeStats.isDctMode ? LCD_COLOR_CYAN : LCD_COLOR_MAGENTA);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
-
-    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-    int h = g_TapeStats.lastTotalTime / 3600;
-    int m = (g_TapeStats.lastTotalTime % 3600) / 60;
-    int s = g_TapeStats.lastTotalTime % 60;
-    snprintf(sBuf, sizeof(sBuf), "Total: %d (%02d:%02d:%02d)", g_TapeStats.logLineCount, h, m, s);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
-    
-    snprintf(sBuf, sizeof(sBuf), "Errors: %d", g_TapeStats.dataErrors);
-    BSP_LCD_SetTextColor(g_TapeStats.dataErrors > 0 ? LCD_COLOR_RED : LCD_COLOR_GREEN);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
-    
-    BSP_LCD_SetTextColor(LCD_COLOR_YELLOW);
-    float sideAPerc = (g_TapeStats.sideALineCount > 0) ? ((float)g_TapeStats.sideAErrors * 100.0f / (float)g_TapeStats.sideALineCount) : 0.0f;
-    int saInt = (int)sideAPerc; int saDec = (int)((sideAPerc - saInt) * 100); if(saDec < 0) saDec = -saDec;
-    snprintf(sBuf, sizeof(sBuf), "Side A: %d/%d (%d.%02d%%)", g_TapeStats.sideAErrors, g_TapeStats.sideALineCount, saInt, saDec);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
-
-    float sideBPerc = (g_TapeStats.sideBLineCount > 0) ? ((float)g_TapeStats.sideBErrors * 100.0f / (float)g_TapeStats.sideBLineCount) : 0.0f;
-    int sbInt = (int)sideBPerc; int sbDec = (int)((sideBPerc - sbInt) * 100); if(sbDec < 0) sbDec = -sbDec;
-    snprintf(sBuf, sizeof(sBuf), "Side B: %d/%d (%d.%02d%%)", g_TapeStats.sideBErrors, g_TapeStats.sideBLineCount, sbInt, sbDec);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
-
-    BSP_LCD_SetTextColor(LCD_COLOR_CYAN);
-    snprintf(sBuf, sizeof(sBuf), "Format Err: L=%d N=%d", g_TapeStats.dataLengthErrors, g_TapeStats.dataErrors);
-    BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE);
-    y += lineHeight;
-
-    // --- Metadata HUD ---
-    if (g_HasMetadata) {
-        y += 4; 
-        BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+    if (g_ShowFSKEncode) {
+        // --- FSK Encode Panel (Optimized Layout) ---
+        y = UI_VIZ_TOP + 5; // Start earlier to save space
         
-        char* filename = strrchr(g_CurrentTrack.sourcePath, '/');
-        if (!filename) filename = strrchr(g_CurrentTrack.sourcePath, '\\');
-        if (filename) filename++; 
-        else filename = g_CurrentTrack.sourcePath;
+        // Row 1: Baud Rate [ < ] [ BAUD ] [ > ]
+        BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+        BSP_LCD_DisplayStringAt(statsX, y + 8, (uint8_t*)"Baud:", LEFT_MODE);
+        
+        int bx = statsX + 45;
+        // Left Arrow
+        BSP_LCD_DrawRect(bx, y, 58, 30);
+        BSP_LCD_DisplayStringAt(bx + (58 - 7)/2, y + 8, (uint8_t*)"<", LEFT_MODE); bx += 63;
+        // Baud Value (Center)
+        BSP_LCD_DrawRect(bx, y, 58, 30);
+        char bBuf[16]; snprintf(bBuf, sizeof(bBuf), "%d", (int)g_BaudRate);
+        BSP_LCD_DisplayStringAt(bx + (58 - strlen(bBuf)*7)/2, y + 8, (uint8_t*)bBuf, LEFT_MODE); bx += 63;
+        // Right Arrow
+        BSP_LCD_DrawRect(bx, y, 58, 30);
+        BSP_LCD_DisplayStringAt(bx + (58 - 7)/2, y + 8, (uint8_t*)">", LEFT_MODE);
+        y += 40;
+        
+        // Row 2: Side Selection [SIDE A] [SIDE B]
+        BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+        BSP_LCD_DisplayStringAt(statsX, y + 8, (uint8_t*)"Side:", LEFT_MODE);
+        bx = statsX + 45;
+        // Side A
+        BSP_LCD_SetTextColor(g_EncodeSide == 'A' ? LCD_COLOR_GREEN : 0xFF555555);
+        BSP_LCD_DrawRect(bx, y, 58, 30);
+        BSP_LCD_DisplayStringAt(bx + 11, y + 8, (uint8_t*)"A", LEFT_MODE); bx += 63;
+        // Side B
+        BSP_LCD_SetTextColor(g_EncodeSide == 'B' ? LCD_COLOR_GREEN : 0xFF555555);
+        BSP_LCD_DrawRect(bx, y, 58, 30);
+        BSP_LCD_DisplayStringAt(bx + 11, y + 8, (uint8_t*)"B", LEFT_MODE);
+        
+        y += 40;
+        
+        // Duration Buttons
+        int durations[] = {45, 60, 120};
+        const char* dLabels[] = {"45M", "60M", "120M"};
+        bx = statsX;
+        for(int i=0; i<3; i++) {
+            bool active = g_IsEncoding && g_EncodeDuration == durations[i];
+            BSP_LCD_SetTextColor(active ? LCD_COLOR_YELLOW : (g_IsEncoding ? 0xFF555555 : LCD_COLOR_WHITE));
+            BSP_LCD_DrawRect(bx, y, 58, 30);
+            BSP_LCD_DisplayStringAt(bx + (58 - strlen(dLabels[i])*7)/2, y + 8, (uint8_t*)dLabels[i], LEFT_MODE);
+            bx += 66;
+        }
+        y += 40;
+        
+        if (g_IsEncoding) {
+            BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+            char pBuf[32];
+            int mins = g_EncodeSeconds / 60;
+            int secs = g_EncodeSeconds % 60;
+            snprintf(pBuf, sizeof(pBuf), "PROG: %02d:%02d / %d:00", mins, secs, g_EncodeDuration);
+            BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)pBuf, LEFT_MODE);
+            y += 15;
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+            BSP_LCD_DrawRect(statsX, y, 190, 25);
+            BSP_LCD_DisplayStringAt(statsX + 40, y + 5, (uint8_t*)"STOP ENCODING", LEFT_MODE);
+        }
 
-        char displayBuf[160];
-        snprintf(displayBuf, sizeof(displayBuf), "FILE: %s", filename);
+    } else {
+        // --- Original TapeStats ---
+        char sBuf[64];
+        
+        int snrInt = (int)g_Modem.lastSNR;
+        int snrDec = (int)((g_Modem.lastSNR - snrInt) * 100);
+        if(snrDec < 0) snrDec = -snrDec;
+        
+        // Speed Offset Calculation
+        float speedOffset = 0;
+        if (g_Modem.lastMeasuredBaud > 0) {
+            speedOffset = (g_Modem.lastMeasuredBaud - g_BaudRate) * 100.0f / g_BaudRate;
+        }
+        int offInt = (int)speedOffset;
+        int offDec = (int)((speedOffset - offInt) * 10);
+        if(offDec < 0) offDec = -offDec;
+        if(offInt < 0) offInt = -offInt;
+        char sign = (speedOffset >= 0) ? '+' : '-';
 
-        int remain = strlen(displayBuf);
-        char* ptr = displayBuf;
-        while (remain > 0 && y < 272 - lineHeight) {
-            char chunk[32];
-            int take = (remain > 30) ? 30 : remain;
-            strncpy(chunk, ptr, take);
-            chunk[take] = '\0';
-            BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)chunk, LEFT_MODE);
+        snprintf(sBuf, sizeof(sBuf), "Baud: %d (%c%d.%d%%) | SNR: %d.%02d", 
+                 (int)g_Modem.lastMeasuredBaud, sign, (int)offInt, (int)offDec, (int)snrInt, (int)snrDec);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
+
+        snprintf(sBuf, sizeof(sBuf), "Side: %c | Stops: %d", g_TapeStats.currentSide, g_TapeStats.totalStops);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
+
+        snprintf(sBuf, sizeof(sBuf), "Mode: %s", g_TapeStats.isDctMode ? "DCT" : "Generic");
+        BSP_LCD_SetTextColor(g_TapeStats.isDctMode ? LCD_COLOR_CYAN : LCD_COLOR_MAGENTA);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
+
+        BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+        int h = g_TapeStats.lastTotalTime / 3600;
+        int m = (g_TapeStats.lastTotalTime % 3600) / 60;
+        int s = g_TapeStats.lastTotalTime % 60;
+        snprintf(sBuf, sizeof(sBuf), "Total: %d (%02d:%02d:%02d)", g_TapeStats.logLineCount, h, m, s);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
+        
+        snprintf(sBuf, sizeof(sBuf), "Errors: %d", g_TapeStats.dataErrors);
+        BSP_LCD_SetTextColor(g_TapeStats.dataErrors > 0 ? LCD_COLOR_RED : LCD_COLOR_GREEN);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
+        
+        BSP_LCD_SetTextColor(LCD_COLOR_YELLOW);
+        float sideAPerc = (g_TapeStats.sideALineCount > 0) ? ((float)g_TapeStats.sideAErrors * 100.0f / (float)g_TapeStats.sideALineCount) : 0.0f;
+        int saInt = (int)sideAPerc; int saDec = (int)((sideAPerc - saInt) * 100); if(saDec < 0) saDec = -saDec;
+        snprintf(sBuf, sizeof(sBuf), "Side A: %d/%d (%d.%02d%%)", g_TapeStats.sideAErrors, g_TapeStats.sideALineCount, saInt, saDec);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
+
+        float sideBPerc = (g_TapeStats.sideBLineCount > 0) ? ((float)g_TapeStats.sideBErrors * 100.0f / (float)g_TapeStats.sideBLineCount) : 0.0f;
+        int sbInt = (int)sideBPerc; int sbDec = (int)((sideBPerc - sbInt) * 100); if(sbDec < 0) sbDec = -sbDec;
+        snprintf(sBuf, sizeof(sBuf), "Side B: %d/%d (%d.%02d%%)", g_TapeStats.sideBErrors, g_TapeStats.sideBLineCount, sbInt, sbDec);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight + 4;
+
+        BSP_LCD_SetTextColor(LCD_COLOR_CYAN);
+        snprintf(sBuf, sizeof(sBuf), "Format Err: L=%d N=%d", g_TapeStats.dataLengthErrors, g_TapeStats.dataErrors);
+        BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE);
+        y += lineHeight;
+
+        // --- Metadata HUD ---
+        if (g_HasMetadata) {
+            y += 4; 
+            BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
             
-            y += lineHeight;
-            ptr += take;
-            remain -= take;
-            // BSP_LCD_SetTextColor(LCD_COLOR_CYAN); // Removed to keep Orange color
+            char* filename = strrchr(g_CurrentTrack.sourcePath, '/');
+            if (!filename) filename = strrchr(g_CurrentTrack.sourcePath, '\\');
+            if (filename) filename++; else filename = g_CurrentTrack.sourcePath;
+
+            char displayBuf[160];
+            snprintf(displayBuf, sizeof(displayBuf), "FILE: %s", filename);
+
+            int remain = strlen(displayBuf);
+            char* ptr = displayBuf;
+            while (remain > 0 && y < 272 - lineHeight) {
+                char chunk[32];
+                int take = (remain > 22) ? 22 : remain; // Harder wrap for right side
+                strncpy(chunk, ptr, take);
+                chunk[take] = '\0';
+                BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)chunk, LEFT_MODE);
+                y += lineHeight; ptr += take; remain -= take;
+            }
         }
     }
     
@@ -1432,7 +1620,15 @@ static void initButtons() {
     buttons[buttonCount++] = (Button){10+(bW+bG)*2, bY, bW, 30, vu_gain_texts[vu_gain_idx], cycleVUGain, LCD_COLOR_MAGENTA, &g_GainAlwaysActive};
     buttons[buttonCount++] = (Button){10+(bW+bG)*3, bY, bW, 30, "WFALL", toggleWaterfall, LCD_COLOR_BLUE, &g_ShowWaterfall};
     buttons[buttonCount++] = (Button){10+(bW+bG)*4, bY, bW, 30, "FSK", toggleFSK, LCD_COLOR_YELLOW, &g_ShowFSK};
-    buttons[buttonCount++] = (Button){10+(bW+bG)*5, bY, bW, 30, "SIM", toggleSim, LCD_COLOR_BROWN, &g_SimulationMode};
+    
+    // FSKe replacement for SIM when FSK is active
+    if (g_ShowFSK) {
+        const char* fskLabel = "FSKenc";
+        buttons[buttonCount++] = (Button){10+(bW+bG)*5, bY, bW, 30, fskLabel, toggleSim, LCD_COLOR_BROWN, &g_ShowFSKEncode};
+    } else {
+        buttons[buttonCount++] = (Button){10+(bW+bG)*5, bY, bW, 30, "SIM", toggleSim, LCD_COLOR_BROWN, &g_SimulationMode};
+    }
+    
     buttons[buttonCount++] = (Button){10+(bW+bG)*6, bY, bW, 30, "IN:MIC", toggleInput, LCD_COLOR_CYAN, &g_InputLineIn};
 }
 
@@ -1447,7 +1643,6 @@ static void handleTouch() {
             int zone = ts.touchX[0] / 160;
             if (zone == 0) { // Left third
                 if (g_ShowFSK) {
-                    // Clear FSK log and stats
                     vTaskSuspendAll();
                     memset(g_FSKText, 0, sizeof(g_FSKText));
                     g_FSKTextLen = 0;
@@ -1456,25 +1651,85 @@ static void handleTouch() {
                     g_CurrentLineIdx = 0;
                     xTaskResumeAll();
                 } else if (g_ShowSpectrum) {
-                    // Cycle Spectrum Modes: Mono -> Split -> Mono LED -> Split LED
                     g_SpectrumMode = (g_SpectrumMode + 1) % 4;
                 }
-            } else if (zone == 1) { // Middle third: Toggle Peak Hold
+            } else if (zone == 1 && !g_ShowFSKEncode) { // Middle third: Toggle Peak Hold (DISABLED if FSKe panel is open)
                 g_EnablePeakHold = !g_EnablePeakHold;
                 if (g_EnablePeakHold) {
                     memset(g_SpectrumPeaks, 0, sizeof(g_SpectrumPeaks));
                     memset(g_VUPeaks, 0, sizeof(g_VUPeaks));
                 }
-            } else if (zone == 2) { // Right third: Cycle Baud Rate
-                if (g_ShowFSK) cycleBaudRate();
+            } else if (zone == 2 || (zone == 1 && g_ShowFSKEncode)) { // Right + Overlap: FSK Encode Panel Interactions
+                if (g_ShowFSK) {
+                    if (g_ShowFSKEncode) {
+                        int statsX = splitX + 10;
+                        int tx = ts.touchX[0];
+                        int ty = ts.touchY[0];
+                        int ry = ty - (UI_VIZ_TOP + 5); // Relative Y from Panel Start
+                        
+                        // 1. Baud Rate [ < ] BAUD [ > ] (ry ~ 0-30)
+                        if (ry >= 0 && ry <= 30) {
+                            if (tx >= statsX + 45 && tx <= statsX + 45 + 58) { // Left arrow
+                                g_BaudIdx = (g_BaudIdx + 2) % 3;
+                            } else if (tx >= statsX + 45 + 126 && tx <= statsX + 45 + 126 + 58) { // Right arrow
+                                g_BaudIdx = (g_BaudIdx + 1) % 3;
+                            }
+                            g_BaudRate = g_BaudRates[g_BaudIdx];
+                            initFSKModems(); // Sync both RX and TX
+                        }
+                        // 2. Side Selection [SIDE A] [SIDE B] (ry ~ 40-70)
+                        else if (ry >= 40 && ry <= 70) {
+                            if (tx >= statsX + 45 && tx <= statsX + 45 + 58) g_EncodeSide = 'A';
+                            else if (tx >= statsX + 45 + 63 && tx <= statsX + 45 + 63 + 58) g_EncodeSide = 'B';
+                        }
+                        // 3. Durations (ry ~ 80-150)
+                        else if (ry >= 80 && ry <= 150) {
+                            int dx = tx - statsX;
+                            if (dx >= 0 && dx < 200) {
+                                if (g_IsEncoding) {
+                                    if (ry >= 115) { // STOP button area (y += 40 from 80 = 120)
+                                        g_IsEncoding = false;
+                                        addFSKDisplayString("\n### ENCODING STOPPED\n");
+                                    }
+                                } else {
+                                    if (dx < 60) g_EncodeDuration = 45;
+                                    else if (dx < 125) g_EncodeDuration = 60;
+                                    else g_EncodeDuration = 120;
+                                    
+                                    g_IsEncoding = true;
+                                    g_SimulationMode = false; // Disable sim for live view
+                                    g_EncodeSeconds = 0;
+                                    g_LastEncodeTick = HAL_GetTick();
+                                    
+                                    // Force Audio Output State
+                                    BSP_AUDIO_OUT_SetVolume(100);
+                                    BSP_AUDIO_OUT_SetMute(AUDIO_MUTE_OFF);
+                                    
+                                    // Trigger immediate buffering of Sec 0
+                                    extern void FSK_Reset_Buffering_State(void);
+                                    FSK_Reset_Buffering_State();
+                                    
+                                    // Reset RX modem state to prevent stale carrier logs
+                                    FSK_Modem_Init(&g_Modem, g_Modem.cfg); 
+                                    
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "\n### STARTING %d MIN DCT (SIDE %c)\n", g_EncodeDuration, g_EncodeSide);
+                                    addFSKDisplayString(msg);
+                                }
+                            }
+                        }
+                    } else {
+                        cycleBaudRate();
+                    }
+                }
             }
-            return; // Don't process buttons if we hit a viz zone
+            return;
         }
 
         // 2. Check Buttons
-        for(int i=0; i<buttonCount; i++) {
+        for(int i = 0; i < buttonCount; i++) {
             Button* b = &buttons[i];
-            if(ts.touchX[0] >= b->x && ts.touchX[0] <= b->x+b->w && ts.touchY[0] >= b->y && ts.touchY[0] <= b->y+b->h) {
+            if(ts.touchX[0] >= b->x && ts.touchX[0] <= b->x + b->w && ts.touchY[0] >= b->y && ts.touchY[0] <= b->y + b->h) {
                 if(b->onClick) b->onClick(); 
                 break;
             }
@@ -1482,10 +1737,18 @@ static void handleTouch() {
     }
 }
 
-static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; g_ShowFSK = false; } }
-static void toggleSpectrum() { g_ShowSpectrum = !g_ShowSpectrum; if(g_ShowSpectrum) { g_ShowWaterfall = false; g_ShowFSK = false; } }
+static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
+static void toggleSpectrum() { g_ShowSpectrum = !g_ShowSpectrum; if(g_ShowSpectrum) { g_ShowWaterfall = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
 static void toggleVU() { g_ShowVUMeter = !g_ShowVUMeter; }
-static void toggleSim() { g_SimulationMode = !g_SimulationMode; fftIdx = 0; }
+static void toggleSim() { 
+    if (g_ShowFSK) {
+        g_ShowFSKEncode = !g_ShowFSKEncode;
+    } else {
+        g_SimulationMode = !g_SimulationMode; 
+        fftIdx = 0; 
+    }
+    initButtons();
+}
 
 static void toggleFSK() {
     g_ShowFSK = !g_ShowFSK;
@@ -1498,18 +1761,13 @@ static void toggleFSK() {
         memset(&g_TapeStats, 0, sizeof(g_TapeStats));
         g_TapeStats.currentSide = 'A';
         g_CurrentLineIdx = 0;
-        // Proportional frequency scaling for shifted audio (Reference: 1200 baud = 1200/2200 Hz)
-        float scale = g_BaudRate / 1200.0f;
-        g_Modem.cfg.freqMark = 1200.0f * scale;
-        g_Modem.cfg.freqSpace = 2200.0f * scale;
-        g_Modem.cfg.baudRate = g_BaudRate;
-        g_Modem.cfg.sampleRate = 12000.0f;
-        g_Modem.cfg.noiseFloor = 0.2f; // Matched to reference (20% signal)
-        g_Modem.cfg.invert = false;
-        FSK_Init(&g_Modem, g_Modem.cfg);
-        
-        printf("VisualizerApp: Init sequence complete.\r\n");
+        initFSKModems();
+        FSK_FIFO_Reset();
+    } else {
+        g_ShowFSKEncode = false; // Hide panel when FSK is off
+        g_IsEncoding = false;    // Stop any active encoding
     }
+    initButtons(); // Refresh button labels (SIM -> FSKe)
 }
 
 extern int16_t playback_buffer[AUDIO_BUFFER_SIZE];
@@ -1522,24 +1780,23 @@ static void Visualizer_InitAudio() {
     }
     first_init = false;
     
-    // 1. Initialize Output FIRST (Headphones)
-    // This ensures the codec reset happens before we configure the microphone/line input
-    if (BSP_AUDIO_OUT_Init(OUTPUT_DEVICE_HEADPHONE, 90, SAMPLING_FREQ) == AUDIO_OK) {
-        memset(playback_buffer, 0, sizeof(playback_buffer));
-        BSP_AUDIO_OUT_Play((uint16_t*)playback_buffer, AUDIO_BUFFER_SIZE);
-        printf("[AUDIO] Output Init OK (Passthrough Active)\r\n");
-    } else {
-        printf("[AUDIO] Output Init FAILED!\r\n");
-    }
-
-    // 2. Initialize Input SECOND (Mic/Line)
     uint16_t dev = g_InputLineIn ? INPUT_DEVICE_INPUT_LINE_1 : INPUT_DEVICE_DIGITAL_MICROPHONE_2;
-    if(BSP_AUDIO_IN_InitEx(dev, SAMPLING_FREQ, 16, 2) == AUDIO_OK) {
+    
+    printf("[AUDIO] Calling BSP_AUDIO_IN_OUT_Init...\r\n");
+    if (BSP_AUDIO_IN_OUT_Init(dev, OUTPUT_DEVICE_HEADPHONE, SAMPLING_FREQ, 16, 2) == AUDIO_OK) {
+        printf("[AUDIO] Init OK. Starting streams...\r\n");
+        
+        memset(playback_buffer, 0, sizeof(playback_buffer));
+        BSP_AUDIO_OUT_SetOutputMode(OUTPUT_DEVICE_HEADPHONE);
+        BSP_AUDIO_OUT_SetVolume(90);
+        BSP_AUDIO_OUT_SetMute(AUDIO_MUTE_OFF);
+        // BSP_AUDIO_OUT_Play size is in BYTES.
+        BSP_AUDIO_OUT_Play((uint16_t*)playback_buffer, AUDIO_BUFFER_SIZE * 2);
+        
         BSP_AUDIO_IN_Record((uint16_t*)audio_buffer, AUDIO_BUFFER_SIZE);
-        // Switch to the appropriate software gain for the new source
         g_AudioGain = g_InputLineIn ? g_LineInGain : g_MicGain;
     } else {
-        printf("[AUDIO] Input Init FAILED!\r\n");
+        printf("[AUDIO] Init FAILED!\r\n");
     }
 }
 
@@ -1558,17 +1815,36 @@ static uint32_t Color565ToARGB(uint16_t rgb565) {
     uint32_t r = (rgb565 >> 11) & 0x1F; uint32_t g = (rgb565 >> 5) & 0x3F; uint32_t b = rgb565 & 0x1F;
     return 0xFF000000 | (((r*255)/31) << 16) | (((g*255)/63) << 8) | ((b*255)/31);
 }
-static void cycleBaudRate(void) {
-    g_BaudIdx = (g_BaudIdx + 1) % 5;
-    g_BaudRate = g_BaudRates[g_BaudIdx];
+static void initFSKModems(void) {
+    if (g_BaudRate < 300.0f) g_BaudRate = 1200.0f; // Safety
     
-    // Scale frequencies proportionally to the baud rate (Reference: 1200 baud = 1200/2200 Hz)
-    float scale = g_BaudRate / 1200.0f;
-    g_Modem.cfg.freqMark = 1200.0f * scale;
-    g_Modem.cfg.freqSpace = 2200.0f * scale;
+    // Standard PC decoders (like minimodem) expect specific Bell standards for different speeds!
+    if (g_BaudRate == 300.0f) {
+        // Bell 103 (300 baud standard)
+        g_Modem.cfg.freqMark = 1270.0f;
+        g_Modem.cfg.freqSpace = 1070.0f;
+    } else {
+        // Bell 202 (1200 baud standard)
+        g_Modem.cfg.freqMark = 1200.0f;
+        g_Modem.cfg.freqSpace = 2200.0f;
+    }
     g_Modem.cfg.baudRate = g_BaudRate;
-    g_Modem.cfg.baudCorrection = g_BaudCorrectionFactor;
-    FSK_Init(&g_Modem, g_Modem.cfg);
+    g_Modem.cfg.sampleRate = 12000.0f;
+    g_Modem.cfg.noiseFloor = 0.2f;
+    g_Modem.cfg.invert = false;
+    FSK_Modem_Init(&g_Modem, g_Modem.cfg);
+    
+    FSK_Config txCfg = g_Modem.cfg;
+    txCfg.sampleRate = 48000.0f;
+    FSK_Modem_Init(&g_TxModem, txCfg);
+    
+    printf("FSK: Modems Init to %d baud (RX=12k, TX=48k)\r\n", (int)g_BaudRate);
+}
+
+static void cycleBaudRate(void) {
+    g_BaudIdx = (g_BaudIdx + 1) % 3; // Fixed: 3 entries, not 5
+    g_BaudRate = g_BaudRates[g_BaudIdx];
+    initFSKModems();
     
     // Clear text area and print new baud
     g_FSKTextLen = 0;
@@ -1576,9 +1852,7 @@ static void cycleBaudRate(void) {
     
     char msg[32];
     snprintf(msg, sizeof(msg), "[BAUD: %d]\n", (int)g_BaudRate);
-    for(int i=0; msg[i]; i++) addFSKChar(msg[i]);
-    
-    printf("FSK: Switched to %d baud\r\n", (int)g_BaudRate);
+    addFSKDisplayString(msg);
 }
 
 static void FillRectDMA2D(uint32_t* fb, int x, int y, int w, int h, uint32_t color) {

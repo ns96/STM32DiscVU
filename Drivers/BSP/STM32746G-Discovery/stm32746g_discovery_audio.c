@@ -910,14 +910,10 @@ uint8_t BSP_AUDIO_IN_OUT_Init(uint16_t InputDevice, uint16_t OutputDevice, uint3
      *   - SAI2_block_A in master TX mode
      *   - SAI2_block_B in slave RX mode synchronous from SAI2_block_A
      */
-    if (InputDevice == INPUT_DEVICE_DIGITAL_MICROPHONE_2)
-    {
-      slot_active = CODEC_AUDIOFRAME_SLOT_13;
-    }
-    else
-    {
-      slot_active = CODEC_AUDIOFRAME_SLOT_02;
-    }
+    // FIX: Always use CODEC_AUDIOFRAME_SLOT_0123 to ensure both IN and OUT 
+    //      have their slots active. Headphones use Slot 0/1 (Timeslot 0), 
+    //      and Mic2 uses Slot 2/3 (Timeslot 1). Restricting this mutes output!
+    slot_active = CODEC_AUDIOFRAME_SLOT_0123;
     SAIx_In_Init(SAI_MODEMASTER_TX, slot_active, AudioFreq);
 
     /* wm8994 codec initialization */
