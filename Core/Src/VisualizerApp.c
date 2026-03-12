@@ -216,6 +216,24 @@ int g_SpectrumMode = 0;
 static const int splitX = 240;
 static void UpdateFSKEncode(void);
 
+// --- Aesthetics Settings ---
+bool g_EnableAesthetics = true;
+
+// EMA filter state for each of the 62 ISO bands. Max bands is 62.
+static float g_BarLevels[62] = {0.0f};
+
+// A-Weighting curve approximations scaled for the 62 bands.
+// Attenuates sub-bass (bands 0-10), neutral lower-mids, boosts upper-mids (bands 30-50), attenuates extreme highs.
+static const float g_AWeightingCurve[62] = {
+    0.10f, 0.12f, 0.15f, 0.18f, 0.22f, 0.26f, 0.31f, 0.36f, 0.42f, 0.49f, // 1-10 (Sub-bass: heavy cut)
+    0.56f, 0.64f, 0.72f, 0.81f, 0.90f, 0.99f, 1.09f, 1.19f, 1.29f, 1.39f, // 11-20 (Bass: moderate cut to neutral)
+    1.49f, 1.58f, 1.67f, 1.76f, 1.84f, 1.91f, 1.98f, 2.05f, 2.11f, 2.16f, // 21-30 (Low-mids to mids: smooth boost)
+    2.21f, 2.25f, 2.28f, 2.30f, 2.32f, 2.34f, 2.35f, 2.36f, 2.36f, 2.35f, // 31-40 (Upper-mids: peak sensitivity)
+    2.34f, 2.32f, 2.29f, 2.25f, 2.20f, 2.14f, 2.08f, 2.00f, 1.92f, 1.83f, // 41-50 (Highs: gentle roll-off)
+    1.73f, 1.62f, 1.50f, 1.38f, 1.25f, 1.11f, 0.97f, 0.82f, 0.66f, 0.50f, // 51-60 (Upper highs: steeper roll-off)
+    0.33f, 0.15f // 61-62 (Air: cut)
+};
+
 // --- Spectrum Colors (Customizable) ---
 #define COLOR_SPEC_L  LCD_COLOR_YELLOW
 #define COLOR_SPEC_R  LCD_COLOR_RED
@@ -329,32 +347,68 @@ static int getLogBarHeight(float* fftData, int barIdx, int maxH, float gain, con
         energySum = fftData[bS];
     }
     
-    float val = energySum * gain;
-    if (val <= 0.01f) return 0;
+    if (g_EnableAesthetics) {
+        // Apply A-Weighting (perceived loudness contour)
+        // If we are in 31-band stereo split, map it across the 62-band curve
+        int curveIdx = (numBands == 31) ? (barIdx * 2) : barIdx;
+        if (curveIdx > 61) curveIdx = 61;
+        energySum *= g_AWeightingCurve[curveIdx];
+    }
     
-    // Fast dB-like conversion approximation to avoid log10f
-    // log10(x) is roughly proportional to the exponent in float representation
-    // Or just use a simple power-law for visual scaling if dB precision isn't critical.
-    // For now, let's use a faster log approximation:
-    float db;
-    if (val < 0.0001f) db = 0;
-    else {
-        // Simple fast log approximation: 20 * log10(x) = 20 * ln(x) / ln(10) ~= 8.68 * ln(x)
-        // Here we can use a simpler power-law for visual: val^0.3 is often enough for "log-like" look
-        // but let's stick to a fast log if possible.
-        // Actually, log10f is about 150 cycles. 62 bands * 150 = 9300 cycles.
-        // Compared to 3x FFTs (150k cycles), it might not be the MAIN bottleneck, but still good to optimize.
+    float val = energySum * gain;
+    float db = 0;
+    
+    if (val > 0.0001f) {
         db = 20.0f * log10f(val + 1.0f); 
     }
     
-    float maxDb = 48.0f; // Lowered from 85.0 to reach red segments more easily
-    float minDb = 12.0f; // Lowered slightly to show more low-level activity
+    // Adjust thresholds if aesthetics are on to compensate for the higher multipliers in the mid-range
+    float maxDb = g_EnableAesthetics ? 55.0f : 48.0f; 
+    float minDb = g_EnableAesthetics ? 18.0f : 12.0f; 
     
-    if (db < minDb) return 0;
-    if (db > maxDb) db = maxDb;
+    float target_h = 0;
+    if (db >= minDb) {
+        if (db > maxDb) db = maxDb;
+        target_h = ((db - minDb) / (maxDb - minDb)) * (float)maxH;
+    }
+
+    if (!g_EnableAesthetics) {
+        return (int)target_h;
+    }
+
+    // --- Temporal Smoothing (Attack/Decay Envelope) ---
+    // Make sure we have enough state allocated - we allocated 62 above. 
+    // For 31 band split L/R, map right channel to indices 31-61.
+    // However, getLogBarHeight doesn't inherently know if it's L or R because it's called per channel array.
+    // A quick hack is to use a static pointer within the caller, but right now we only have barIdx.
+    // Let's use a static rolling index or base it on memory address to uniquely track state.
     
-    int h = (int)(((db - minDb) / (maxDb - minDb)) * (float)maxH);
-    return h;
+    // Wait, getLogBarHeight is called consecutively for L then R.
+    // We need unique state indices. Let's pass a true global state index.
+    // Actually, modifying the signature of getLogBarHeight is better to give it an absolute index for state tracking.
+    
+    // Instead of changing signature right away, we can derive the absolute state index:
+    // If numBands is 62 (Mono), 0-61.
+    // If numBands is 31 (Split), determine if it's left or right based on the array pointer.
+    extern float vRealFFTR[FFT_SIZE]; // Check if we are passing the right channel
+    int stateIdx = barIdx;
+    if (numBands == 31 && fftData == vRealFFTR) {
+        stateIdx = barIdx + 31; // Shift right channel state up
+    }
+    
+    float current_level = g_BarLevels[stateIdx];
+    
+    if (target_h > current_level) {
+        // Fast Attack
+        current_level = (target_h * 0.7f) + (current_level * 0.3f);
+    } else {
+        // Slow Decay (Gravity)
+        current_level = (target_h * 0.10f) + (current_level * 0.90f);
+    }
+    
+    g_BarLevels[stateIdx] = current_level;
+    
+    return (int)current_level;
 }
 
 // --- FSK Decoder State ---
@@ -1314,8 +1368,10 @@ static void drawVU() {
 // --- FSK Buffering State Reset ---
 // This ensures that when encoding starts, we immediately buffer Sec 0
 static uint32_t g_lastGenSec = 0xFFFFFFFF;
+static int g_repeatCount = 0;
 void FSK_Reset_Buffering_State(void) {
     g_lastGenSec = 0xFFFFFFFF;
+    g_repeatCount = 0;
     // Also clear the FIFO to prevent stale audio from previous runs
     g_FSK_FIFO_ReadIdx = 0;
     g_FSK_FIFO_WriteIdx = 0;
@@ -1347,8 +1403,18 @@ static void UpdateFSKEncode(void) {
     // A 1-second block at 300 baud is roughly 49600 samples.
     if (used <= (FSK_FIFO_SIZE - 66000)) {
         uint32_t secToGen;
-        if (g_lastGenSec == 0xFFFFFFFF) secToGen = 0; // START AT ZERO
-        else secToGen = g_lastGenSec + 1;
+        if (g_lastGenSec == 0xFFFFFFFF) {
+            secToGen = 0;
+            g_repeatCount = 1;
+        } else {
+            if (g_repeatCount < 4) {
+                secToGen = g_lastGenSec;
+                g_repeatCount++;
+            } else {
+                secToGen = g_lastGenSec + 1;
+                g_repeatCount = 1;
+            }
+        }
         
         if (secToGen < g_EncodeDuration * 60) {
             g_lastGenSec = secToGen;
@@ -1502,15 +1568,15 @@ static void drawFSKText(void) {
         y += 40;
         
         // Duration Buttons
-        int durations[] = {45, 60, 120};
-        const char* dLabels[] = {"45M", "60M", "120M"};
+        int durations[] = {45, 90, 120, 240};
+        const char* dLabels[] = {"45M", "90M", "120M", "240M"};
         bx = statsX;
-        for(int i=0; i<3; i++) {
+        for(int i=0; i<4; i++) {
             bool active = g_IsEncoding && g_EncodeDuration == durations[i];
             BSP_LCD_SetTextColor(active ? LCD_COLOR_YELLOW : (g_IsEncoding ? 0xFF555555 : LCD_COLOR_WHITE));
-            BSP_LCD_DrawRect(bx, y, 58, 30);
-            BSP_LCD_DisplayStringAt(bx + (58 - strlen(dLabels[i])*7)/2, y + 8, (uint8_t*)dLabels[i], LEFT_MODE);
-            bx += 66;
+            BSP_LCD_DrawRect(bx, y, 50, 30);
+            BSP_LCD_DisplayStringAt(bx + (50 - strlen(dLabels[i])*7)/2, y + 8, (uint8_t*)dLabels[i], LEFT_MODE);
+            bx += 58;
         }
         y += 40;
         
@@ -1605,16 +1671,16 @@ static void drawFSKText(void) {
                 chunk[take] = '\0';
                 BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)chunk, LEFT_MODE);
                 y += lineHeight; ptr += take; remain -= take;
-            }
         }
     }
     
     // No more global resume here, it's handled inside the logical blocks
+    }
 }
-
 
 static void initButtons() {
     buttonCount = 0; int bY = 230, bW = 58, bG = 8;
+    // Buttons 0-4
     buttons[buttonCount++] = (Button){10, bY, bW, 30, "SPEC", toggleSpectrum, LCD_COLOR_BLUE, &g_ShowSpectrum};
     buttons[buttonCount++] = (Button){10+(bW+bG), bY, bW, 30, "VU", toggleVU, LCD_COLOR_BLUE, &g_ShowVUMeter};
     buttons[buttonCount++] = (Button){10+(bW+bG)*2, bY, bW, 30, vu_gain_texts[vu_gain_idx], cycleVUGain, LCD_COLOR_MAGENTA, &g_GainAlwaysActive};
@@ -1629,6 +1695,7 @@ static void initButtons() {
         buttons[buttonCount++] = (Button){10+(bW+bG)*5, bY, bW, 30, "SIM", toggleSim, LCD_COLOR_BROWN, &g_SimulationMode};
     }
     
+    // Button 6
     buttons[buttonCount++] = (Button){10+(bW+bG)*6, bY, bW, 30, "IN:MIC", toggleInput, LCD_COLOR_CYAN, &g_InputLineIn};
 }
 
@@ -1639,6 +1706,13 @@ static void handleTouch() {
         static uint32_t lastT = 0; if(HAL_GetTick() - lastT < 200) return;
         lastT = HAL_GetTick();
         
+        // 1. Header Zone (Top 30px) - Toggle Aesthetics
+        if (ts.touchY[0] < UI_VIZ_TOP) {
+            g_EnableAesthetics = !g_EnableAesthetics;
+            return;
+        }
+        
+        // 2. Visualizer Zone (Middle)
         if (ts.touchY[0] >= UI_VIZ_TOP && ts.touchY[0] < UI_VIZ_BOTTOM) {
             int zone = ts.touchX[0] / 160;
             if (zone == 0) { // Left third
@@ -1685,16 +1759,17 @@ static void handleTouch() {
                         // 3. Durations (ry ~ 80-150)
                         else if (ry >= 80 && ry <= 150) {
                             int dx = tx - statsX;
-                            if (dx >= 0 && dx < 200) {
+                            if (dx >= 0 && dx < 224) {
                                 if (g_IsEncoding) {
                                     if (ry >= 115) { // STOP button area (y += 40 from 80 = 120)
                                         g_IsEncoding = false;
                                         addFSKDisplayString("\n### ENCODING STOPPED\n");
                                     }
                                 } else {
-                                    if (dx < 60) g_EncodeDuration = 45;
-                                    else if (dx < 125) g_EncodeDuration = 60;
-                                    else g_EncodeDuration = 120;
+                                    if (dx < 54) g_EncodeDuration = 45;
+                                    else if (dx < 112) g_EncodeDuration = 90;
+                                    else if (dx < 170) g_EncodeDuration = 120;
+                                    else g_EncodeDuration = 240;
                                     
                                     g_IsEncoding = true;
                                     g_SimulationMode = false; // Disable sim for live view

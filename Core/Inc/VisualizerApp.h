@@ -47,6 +47,7 @@ extern bool g_ShowFSK;
 extern bool g_ShowFSKEncode;
 extern bool g_SimulationMode; 
 extern bool g_InputLineIn;
+extern bool g_EnableAesthetics;
 extern volatile bool g_IsEncoding;
 
 // Audio context needed for switching inputs
