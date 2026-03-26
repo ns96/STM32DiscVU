@@ -26,6 +26,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Java
+*.class
+
 # Documentation / Artifacts (Optional: remove if you want to keep them)
 task.md
 implementation_plan.md
