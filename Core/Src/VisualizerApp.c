@@ -205,6 +205,7 @@ bool g_SimulationMode = true;
 bool g_InputLineIn = false;
 bool g_EnablePeakHold = true;
 bool g_ShowFSK = false;
+bool g_ShowPCMF1 = false;
 bool g_ShowFSKEncode = false;
 char g_EncodeSide = 'A';
 int g_EncodeDuration = 45;
@@ -215,6 +216,17 @@ FSK_Modem g_TxModem;
 int g_SpectrumMode = 0;
 static const int splitX = 240;
 static void UpdateFSKEncode(void);
+static void drawPCMF1(void);
+
+// PCM-F1 State
+#define PCMF1_RING_SIZE 2048
+static int16_t g_PCMF1_RingL[PCMF1_RING_SIZE];
+static int16_t g_PCMF1_RingR[PCMF1_RING_SIZE];
+static uint32_t g_PCMF1_RingIdx = 0;
+static uint16_t enc_hist_w[128][6] = {{0}};
+static uint16_t enc_hist_p[128] = {0};
+static uint16_t enc_hist_q[128] = {0};
+static uint32_t global_enc_line = 0;
 
 // --- Aesthetics Settings ---
 bool g_EnableAesthetics = true;
@@ -643,6 +655,16 @@ static void initWaterfallLUT(void) {
     }
 }
 
+static uint16_t crc16_ccitt(uint8_t *bits, int offset, int len) {
+    uint16_t crc = 0x0000;
+    for (int i = 0; i < len; i++) {
+        uint8_t crc_bit = (crc & 0x8000) ? 1 : 0;
+        crc <<= 1;
+        if (bits[offset + i] ^ crc_bit) crc ^= 0x1021;
+    }
+    return crc;
+}
+
 // --- UI State ---
 #define MAX_BUTTONS 7
 static Button buttons[MAX_BUTTONS];
@@ -796,6 +818,31 @@ void Visualizer_Init(void) {
 void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
     extern volatile bool g_IsEncoding;
     if (g_IsEncoding) g_SimulationMode = false; // Force real view during encoding
+
+    // PCM-F1 Ring Buffer (Always store raw samples for bit-stream visualization)
+    uint32_t step = 4;
+    for (uint32_t i = 0; i < samples; i += step) {
+        int16_t sL, sR;
+        if (g_SimulationMode && !g_IsEncoding) {
+            static float p = 0.0f;
+            sL = (int16_t)(sinf(p) * 16383.0f);
+            sR = (int16_t)(cosf(p * 0.9f) * 16383.0f);
+            p += 0.05f; 
+            if (p > 6.283185f) p -= 6.283185f;
+        } else {
+            int32_t sL_sum = (int32_t)inBuf[i] + (int32_t)inBuf[i + 1];
+            int32_t sR_sum = (int32_t)inBuf[i + 2] + (int32_t)inBuf[i + 3];
+            // Clamp to 16-bit
+            if (sL_sum > 32767) sL_sum = 32767; else if (sL_sum < -32768) sL_sum = -32768;
+            if (sR_sum > 32767) sR_sum = 32767; else if (sR_sum < -32768) sR_sum = -32768;
+            sL = (int16_t)sL_sum;
+            sR = (int16_t)sR_sum;
+        }
+        g_PCMF1_RingL[g_PCMF1_RingIdx] = sL;
+        g_PCMF1_RingR[g_PCMF1_RingIdx] = sR;
+        g_PCMF1_RingIdx = (g_PCMF1_RingIdx + 1) % PCMF1_RING_SIZE;
+    }
+
     if (g_SimulationMode && !g_IsEncoding) return;
 
     // Cache management is handled by the caller (main.c)
@@ -813,12 +860,6 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
         g_MaxSignalLevel = 0.0f; // Reset peak hold
     }
 
-    // 2. Full-Sample VU Energy Detection (Raw 48kHz RMS Scan)
-    // Handle 4-slot TDM (I2S alignment on STM32)
-    // Left channel occupies the first half of the frame (Slots 0 and 1 = indices i, i+1)
-    // Right channel occupies the second half of the frame (Slots 2 and 3 = indices i+2, i+3)
-    // LineIn uses Slots 0 and 2. Mic2 uses Slots 1 and 3. Summing them handles either source seamlessly.
-    uint32_t step = 4;
     float sumSqL = 0, sumSqR = 0;
     for (uint32_t i = 0; i < samples; i += step) {
         float sL = ((float)inBuf[i] + (float)inBuf[i + 1]) / 32768.0f;
@@ -947,7 +988,10 @@ void Visualizer_Update(void) {
     }
 
     // 2. Draw Visualizations (Background layer)
-    if (g_ShowWaterfall) drawWaterfall();
+    if (g_ShowWaterfall) {
+        if (g_ShowPCMF1) drawPCMF1();
+        else drawWaterfall();
+    }
     else if (g_ShowSpectrum) drawSpectrum();
     
     if (g_ShowFSK) drawFSKText();
@@ -1298,6 +1342,94 @@ static void drawWaterfall() {
     if (g_WfallHead > 0) {
         int rowsB = g_WfallHead;
         CopyBlockDMA2D(wfall_fb, &screen_ptr[rowsA * width], width, rowsB);
+    }
+}
+
+static void drawPCMF1() {
+    int startY = UI_VIZ_TOP;
+    int height = UI_VIZ_BOTTOM - UI_VIZ_TOP; // 200 lines
+    uint32_t* back_fb = (uint32_t*)hLtdcHandler.LayerCfg[0].FBStartAdress;
+    
+    // PCM-F1 Constants
+    const int BIT_WIDTH = 3;
+    const int BITS_PER_LINE = 137;
+    const int TOTAL_WIDTH = BITS_PER_LINE * BIT_WIDTH; // 411
+    const int X_OFFSET = (480 - TOTAL_WIDTH) / 2;
+    
+    // Each line needs 6 mono samples (3 stereo frames).
+    // 200 lines * 3 frames = 600 stereo frames (1200 mono samples).
+    int ringReadIdx = (g_PCMF1_RingIdx - 600 + PCMF1_RING_SIZE) % PCMF1_RING_SIZE;
+    int monoReadIdx = 0;
+    
+    uint8_t bits[137];
+    
+    for (int y = 0; y < height; y++) {
+        uint32_t *dest_row = back_fb + ((startY + y) * 480);
+        
+        memset(bits, 0, sizeof(bits));
+        // Sync pattern: 0 1 0 1
+        bits[0]=0; bits[1]=1; bits[2]=0; bits[3]=1; 
+        // Control: 1 1 1 1 0
+        bits[132]=1; bits[133]=1; bits[134]=1; bits[135]=1; bits[136]=0;
+
+        uint16_t w[6], q_bits[6];
+        for(int i = 0; i < 6; i++) {
+            int16_t samp;
+            if (monoReadIdx % 2 == 0) {
+                samp = g_PCMF1_RingL[ringReadIdx];
+            } else {
+                samp = g_PCMF1_RingR[ringReadIdx];
+                ringReadIdx = (ringReadIdx + 1) % PCMF1_RING_SIZE;
+            }
+            w[i] = (samp >> 2) & 0x3FFF; // 14-bit
+            q_bits[i] = samp & 0x03;      // 2-bit
+            monoReadIdx++;
+        }
+        
+        uint16_t p = w[0]^w[1]^w[2]^w[3]^w[4]^w[5];
+        // Q parity calculation (LSbs interleaved)
+        uint16_t q = (q_bits[0] << 12) | (q_bits[1] << 10) | (q_bits[2] << 8) |
+                    (q_bits[3] << 6)  | (q_bits[4] << 4)  | (q_bits[5] << 2);
+        
+        // Interleave logic (history of 128 lines)
+        int hist_idx = global_enc_line % 128;
+        for(int i=0; i<6; i++) enc_hist_w[hist_idx][i] = w[i];
+        enc_hist_p[hist_idx] = p;
+        enc_hist_q[hist_idx] = q;
+
+        // Pack interleaved words
+        uint16_t words_to_pack[7];
+        words_to_pack[0] = enc_hist_w[(global_enc_line - 0   + 128) % 128][0];
+        words_to_pack[1] = enc_hist_w[(global_enc_line - 16  + 128) % 128][1];
+        words_to_pack[2] = enc_hist_w[(global_enc_line - 32  + 128) % 128][2];
+        words_to_pack[3] = enc_hist_w[(global_enc_line - 48  + 128) % 128][3];
+        words_to_pack[4] = enc_hist_w[(global_enc_line - 64  + 128) % 128][4];
+        words_to_pack[5] = enc_hist_w[(global_enc_line - 80  + 128) % 128][5];
+        words_to_pack[6] = enc_hist_p[(global_enc_line - 96  + 128) % 128];
+        // words_to_pack[7] = enc_hist_q[(global_enc_line - 112 + 128) % 128]; // Q is at bits 118+
+
+        for (int w_idx=0; w_idx<7; w_idx++) {
+            for(int b=0; b<14; b++) {
+                bits[4+(w_idx*14)+b] = ((words_to_pack[w_idx]>>(13-b))&1);
+            }
+        }
+
+        uint16_t crc = crc16_ccitt(bits, 4, 98);
+        for (int b=0; b<16; b++) bits[102+b] = ((crc>>(15-b))&1);
+        
+        // Final bits (Q area)
+        uint16_t line_q = enc_hist_q[(global_enc_line - 112 + 128) % 128];
+        for (int b=0; b<14; b++) bits[118+b] = ((line_q>>(13-b))&1);
+
+        global_enc_line++;
+
+        // Draw bits
+        for (int b=0; b<BITS_PER_LINE; b++) {
+            uint32_t color = bits[b] ? LCD_COLOR_WHITE : LCD_COLOR_BLACK;
+            for (int px=0; px<BIT_WIDTH; px++) {
+                dest_row[X_OFFSET + (b*BIT_WIDTH) + px] = color;
+            }
+        }
     }
 }
 
@@ -1734,6 +1866,10 @@ static void handleTouch() {
                     memset(g_VUPeaks, 0, sizeof(g_VUPeaks));
                 }
             } else if (zone == 2 || (zone == 1 && g_ShowFSKEncode)) { // Right + Overlap: FSK Encode Panel Interactions
+                if (g_ShowWaterfall) {
+                    g_ShowPCMF1 = !g_ShowPCMF1;
+                    return;
+                }
                 if (g_ShowFSK) {
                     if (g_ShowFSKEncode) {
                         int statsX = splitX + 10;
@@ -1812,7 +1948,7 @@ static void handleTouch() {
     }
 }
 
-static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
+static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; g_ShowPCMF1 = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
 static void toggleSpectrum() { g_ShowSpectrum = !g_ShowSpectrum; if(g_ShowSpectrum) { g_ShowWaterfall = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
 static void toggleVU() { g_ShowVUMeter = !g_ShowVUMeter; }
 static void toggleSim() { 
