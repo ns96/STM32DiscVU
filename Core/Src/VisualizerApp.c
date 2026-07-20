@@ -277,6 +277,21 @@ static float vu_gain_vals[] = {0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
 static const char* vu_gain_texts[] = {"x0.5", "x1", "x2", "x4", "x8"};
 static int vu_gain_idx = 2; // Default to 2.0
 static bool g_GainAlwaysActive = true;
+float g_PCMF1Gain = 1.0f;
+
+static void updateActiveGain() {
+    if (g_ShowVUMeter) {
+        g_VUGain = vu_gain_vals[vu_gain_idx];
+    } else if (g_ShowSpectrum) {
+        g_SpectrumGain = 3.0f * vu_gain_vals[vu_gain_idx];
+    } else if (g_ShowWaterfall) {
+        if (g_ShowPCMF1) {
+            g_PCMF1Gain = vu_gain_vals[vu_gain_idx] / 2.0f;
+        } else {
+            g_WaterfallGain = 3.0f * vu_gain_vals[vu_gain_idx];
+        }
+    }
+}
 
 // --- Buffers & Double Buffering State ---
 static uint32_t fb_addresses[2] = { LCD_FB_START_ADDRESS, LCD_FB_START_ADDRESS + LCD_FB_OFFSET };
@@ -760,6 +775,8 @@ void Visualizer_Init(void) {
     
     printf("VisualizerApp: initButtons...\r\n");
     initButtons();
+
+    updateActiveGain();
     
     printf("VisualizerApp: Visualizer_InitAudio...\r\n");
     Visualizer_InitAudio();
@@ -838,8 +855,12 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
             sL = (int16_t)sL_sum;
             sR = (int16_t)sR_sum;
         }
-        g_PCMF1_RingL[g_PCMF1_RingIdx] = sL;
-        g_PCMF1_RingR[g_PCMF1_RingIdx] = sR;
+        int32_t scaledL = (int32_t)(sL * g_PCMF1Gain);
+        int32_t scaledR = (int32_t)(sR * g_PCMF1Gain);
+        if (scaledL > 32767) scaledL = 32767; else if (scaledL < -32768) scaledL = -32768;
+        if (scaledR > 32767) scaledR = 32767; else if (scaledR < -32768) scaledR = -32768;
+        g_PCMF1_RingL[g_PCMF1_RingIdx] = (int16_t)scaledL;
+        g_PCMF1_RingR[g_PCMF1_RingIdx] = (int16_t)scaledR;
         g_PCMF1_RingIdx = (g_PCMF1_RingIdx + 1) % PCMF1_RING_SIZE;
     }
 
@@ -1868,6 +1889,7 @@ static void handleTouch() {
             } else if (zone == 2 || (zone == 1 && g_ShowFSKEncode)) { // Right + Overlap: FSK Encode Panel Interactions
                 if (g_ShowWaterfall) {
                     g_ShowPCMF1 = !g_ShowPCMF1;
+                    updateActiveGain();
                     return;
                 }
                 if (g_ShowFSK) {
@@ -1948,9 +1970,12 @@ static void handleTouch() {
     }
 }
 
-static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; g_ShowPCMF1 = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
-static void toggleSpectrum() { g_ShowSpectrum = !g_ShowSpectrum; if(g_ShowSpectrum) { g_ShowWaterfall = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); }
-static void toggleVU() { g_ShowVUMeter = !g_ShowVUMeter; }
+static void toggleWaterfall() { g_ShowWaterfall = !g_ShowWaterfall; if(g_ShowWaterfall) { g_ShowSpectrum = false; g_ShowPCMF1 = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); updateActiveGain(); }
+static void toggleSpectrum() { g_ShowSpectrum = !g_ShowSpectrum; if(g_ShowSpectrum) { g_ShowWaterfall = false; if(g_ShowFSK) { g_ShowFSK = false; g_ShowFSKEncode = false; } } initButtons(); updateActiveGain(); }
+static void toggleVU() {
+    g_ShowVUMeter = !g_ShowVUMeter;
+    updateActiveGain();
+}
 static void toggleSim() { 
     if (g_ShowFSK) {
         g_ShowFSKEncode = !g_ShowFSKEncode;
@@ -2019,7 +2044,7 @@ static void toggleInput() {
 
 static void cycleVUGain() {
     vu_gain_idx = (vu_gain_idx + 1) % 5;
-    g_VUGain = vu_gain_vals[vu_gain_idx];
+    updateActiveGain();
     buttons[2].text = vu_gain_texts[vu_gain_idx];
 }
 static uint32_t Color565ToARGB(uint16_t rgb565) {
