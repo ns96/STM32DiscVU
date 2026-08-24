@@ -13,6 +13,9 @@
 #include <string.h>
 #include <stdio.h>
 #include "fatfs.h" // Required for DCT File Mapping
+#include "WiFiApp.h"
+
+int g_HeaderView = 0; // 0: System Stats, 1: Wi-Fi Info
 
 // --- DCT Mapping Helper State (RAM Based) ---
 typedef struct {
@@ -154,7 +157,8 @@ static bool GetMappedRecord(char side, int totalTime, char* outHash, char* outFu
 // --- FSK Debug & Config ---
 static float g_BaudRates[] = {300.0f, 600.0f, 1200.0f};
 static int g_BaudIdx = 2; // Default to 1200
-static float g_BaudRate = 1200.0f;
+float g_BaudRate = 1200.0f;
+bool g_FSKProportionalMode = false; // Default: deactivated (standard Bell frequencies)
 static uint32_t g_LastDebugTime = 0;
 float g_MaxSignalLevel = 0.0f;
 
@@ -306,7 +310,7 @@ extern volatile uint32_t g_IdleTicks;
 static uint32_t cpu_baseline = 0;
 static uint32_t last_idle_val = 0;
 static uint32_t last_cpu_tick = 0;
-static int current_cpu_load = 0;
+int current_cpu_load = 0;
 
 // --- Audio / Viz State ---
 static float vReal[FFT_SIZE];
@@ -465,6 +469,12 @@ static TapeStats g_TapeStats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', false};
 static char g_CurrentLineBuf[64];
 static int g_CurrentLineIdx = 0;
 
+#define MAX_RX_LINES 8
+#define RX_LINE_LEN 64
+static char g_RxLines[MAX_RX_LINES][RX_LINE_LEN];
+static int g_RxLineCount = 0;
+static int g_RxLineHead = 0;
+
 // Offload State for Main Thread
 volatile bool g_LineReady = false;
 char g_ReadyLineBuf[64];
@@ -603,6 +613,15 @@ void addFSKChar(char c) {
         if (g_CurrentLineIdx > 0) {
             g_CurrentLineBuf[g_CurrentLineIdx] = '\0';
             
+            // Push to live web streaming queue
+            WiFiApp_PushRawLine(g_CurrentLineBuf);
+
+            // Store complete line into rx_lines history
+            strncpy(g_RxLines[g_RxLineHead], g_CurrentLineBuf, RX_LINE_LEN - 1);
+            g_RxLines[g_RxLineHead][RX_LINE_LEN - 1] = '\0';
+            g_RxLineHead = (g_RxLineHead + 1) % MAX_RX_LINES;
+            if (g_RxLineCount < MAX_RX_LINES) g_RxLineCount++;
+
             // Offload: Copy to ready buffer and signal main thread
             // This prevents blocking the modem task with SD Card I/O
             if (!g_LineReady) {
@@ -615,6 +634,7 @@ void addFSKChar(char c) {
         }
     } else if (g_CurrentLineIdx < sizeof(g_CurrentLineBuf) - 1) {
         g_CurrentLineBuf[g_CurrentLineIdx++] = c;
+        g_CurrentLineBuf[g_CurrentLineIdx] = '\0';
     }
 
     xTaskResumeAll();
@@ -1074,8 +1094,13 @@ void Visualizer_Update(void) {
     if (dispL > 100.0f) dispL = 100.0f;
     if (dispR > 100.0f) dispR = 100.0f;
 
-    snprintf(buf, sizeof(buf), "DiscVU %dkHz / L:%03d%% R:%03d%% CPU:%d%% FPS:%d", 
-             freq_khz, (int)dispL, (int)dispR, current_cpu_load, current_fps);
+    if (g_HeaderView == 0) {
+        snprintf(buf, sizeof(buf), "DiscVU %dkHz / L:%03d%% R:%03d%% CPU:%d%% FPS:%d", 
+                 freq_khz, (int)dispL, (int)dispR, current_cpu_load, current_fps);
+    } else {
+        snprintf(buf, sizeof(buf), "DiscVU %s / CPU:%d%% FPS:%d", 
+                 WiFiApp_GetDisplayStatus(), current_cpu_load, current_fps);
+    }
     BSP_LCD_DisplayStringAt(10, 7, (uint8_t*)buf, LEFT_MODE);
 
     // Final safety wait: ensure all DMA2D operations completed before returning
@@ -1698,7 +1723,7 @@ static void drawFSKText(void) {
         BSP_LCD_DisplayStringAt(bx + (58 - 7)/2, y + 8, (uint8_t*)"<", LEFT_MODE); bx += 63;
         // Baud Value (Center)
         BSP_LCD_DrawRect(bx, y, 58, 30);
-        char bBuf[16]; snprintf(bBuf, sizeof(bBuf), "%d", (int)g_BaudRate);
+        char bBuf[16]; snprintf(bBuf, sizeof(bBuf), "%d%s", (int)g_BaudRate, g_FSKProportionalMode ? "*" : "");
         BSP_LCD_DisplayStringAt(bx + (58 - strlen(bBuf)*7)/2, y + 8, (uint8_t*)bBuf, LEFT_MODE); bx += 63;
         // Right Arrow
         BSP_LCD_DrawRect(bx, y, 58, 30);
@@ -1765,8 +1790,9 @@ static void drawFSKText(void) {
         if(offInt < 0) offInt = -offInt;
         char sign = (speedOffset >= 0) ? '+' : '-';
 
-        snprintf(sBuf, sizeof(sBuf), "Baud: %d (%c%d.%d%%) | SNR: %d.%02d", 
-                 (int)g_Modem.lastMeasuredBaud, sign, (int)offInt, (int)offDec, (int)snrInt, (int)snrDec);
+        snprintf(sBuf, sizeof(sBuf), "Baud: %d%s (%c%d.%d%%) | SNR: %d.%02d", 
+                 (int)g_Modem.lastMeasuredBaud, g_FSKProportionalMode ? "*" : "",
+                 sign, (int)offInt, (int)offDec, (int)snrInt, (int)snrDec);
         BSP_LCD_DisplayStringAt(statsX, y, (uint8_t*)sBuf, LEFT_MODE); y += lineHeight;
 
         snprintf(sBuf, sizeof(sBuf), "Side: %c | Stops: %d", g_TapeStats.currentSide, g_TapeStats.totalStops);
@@ -1859,9 +1885,34 @@ static void handleTouch() {
         static uint32_t lastT = 0; if(HAL_GetTick() - lastT < 200) return;
         lastT = HAL_GetTick();
         
-        // 1. Header Zone (Top 30px) - Toggle Aesthetics
+        // 1. Header Zone (Top 30px) - 3 Buttons (Left, Center, Right)
         if (ts.touchY[0] < UI_VIZ_TOP) {
-            g_EnableAesthetics = !g_EnableAesthetics;
+            int headerZone = ts.touchX[0] / 160;
+            if (headerZone == 0) {
+                // Left Button: Toggle between System Stats and Wi-Fi Info
+                g_HeaderView = (g_HeaderView + 1) % 2;
+                printf("[UI] Header Left Tapped -> HeaderView: %d\r\n", g_HeaderView);
+            } else if (headerZone == 1) {
+                // Center Button: Toggle Response Behavior (Fast vs Slow)
+                g_EnableAesthetics = !g_EnableAesthetics;
+                printf("[UI] Header Center Tapped -> Aesthetics (Resp): %d\r\n", g_EnableAesthetics);
+            } else if (headerZone == 2) {
+                // Right Button: Toggle FSK Proportional Tape-Speed Scaling Mode
+                g_FSKProportionalMode = !g_FSKProportionalMode;
+                initFSKModems();
+                printf("[UI] Header Right Tapped -> FSK Tape Scaling: %s (Baud: %d, M: %.1f Hz, S: %.1f Hz)\r\n", 
+                       g_FSKProportionalMode ? "ACTIVE (Proportional 1200Hz base)" : "INACTIVE (Bell Standards)",
+                       (int)g_BaudRate, g_Modem.cfg.freqMark, g_Modem.cfg.freqSpace);
+                if (g_ShowFSK) {
+                    char msg[64];
+                    if (g_FSKProportionalMode) {
+                        snprintf(msg, sizeof(msg), "\n[BAUD: %d* (TAPE SCALE)]\n", (int)g_BaudRate);
+                    } else {
+                        snprintf(msg, sizeof(msg), "\n[BAUD: %d (STD BELL)]\n", (int)g_BaudRate);
+                    }
+                    addFSKDisplayString(msg);
+                }
+            }
             return;
         }
         
@@ -2054,15 +2105,24 @@ static uint32_t Color565ToARGB(uint16_t rgb565) {
 static void initFSKModems(void) {
     if (g_BaudRate < 300.0f) g_BaudRate = 1200.0f; // Safety
     
-    // Standard PC decoders (like minimodem) expect specific Bell standards for different speeds!
-    if (g_BaudRate == 300.0f) {
-        // Bell 103 (300 baud standard)
-        g_Modem.cfg.freqMark = 1270.0f;
-        g_Modem.cfg.freqSpace = 1070.0f;
+    if (g_FSKProportionalMode) {
+        // Proportional Tape-Speed Scaling Mode:
+        // Assume base tape was recorded at 1200 baud with Mark=1200Hz, Space=2200Hz.
+        // Frequencies scale down proportionally with playback speed (e.g. 600 baud -> 600Hz/1100Hz).
+        float ratio = g_BaudRate / 1200.0f;
+        g_Modem.cfg.freqMark = 1200.0f * ratio;
+        g_Modem.cfg.freqSpace = 2200.0f * ratio;
     } else {
-        // Bell 202 (1200 baud standard)
-        g_Modem.cfg.freqMark = 1200.0f;
-        g_Modem.cfg.freqSpace = 2200.0f;
+        // Standard PC decoders (like minimodem) expect specific Bell standards for different speeds!
+        if (g_BaudRate == 300.0f) {
+            // Bell 103 (300 baud standard)
+            g_Modem.cfg.freqMark = 1270.0f;
+            g_Modem.cfg.freqSpace = 1070.0f;
+        } else {
+            // Bell 202 (1200 baud standard)
+            g_Modem.cfg.freqMark = 1200.0f;
+            g_Modem.cfg.freqSpace = 2200.0f;
+        }
     }
     g_Modem.cfg.baudRate = g_BaudRate;
     g_Modem.cfg.sampleRate = 12000.0f;
@@ -2074,7 +2134,9 @@ static void initFSKModems(void) {
     txCfg.sampleRate = 48000.0f;
     FSK_Modem_Init(&g_TxModem, txCfg);
     
-    printf("FSK: Modems Init to %d baud (RX=12k, TX=48k)\r\n", (int)g_BaudRate);
+    printf("FSK: Modems Init to %d baud (Mark: %.1f Hz, Space: %.1f Hz, TapeScale: %s, RX=12k, TX=48k)\r\n", 
+           (int)g_BaudRate, g_Modem.cfg.freqMark, g_Modem.cfg.freqSpace,
+           g_FSKProportionalMode ? "ON" : "OFF");
 }
 
 static void cycleBaudRate(void) {
@@ -2087,7 +2149,7 @@ static void cycleBaudRate(void) {
     g_FSKText[0] = '\0';
     
     char msg[32];
-    snprintf(msg, sizeof(msg), "[BAUD: %d]\n", (int)g_BaudRate);
+    snprintf(msg, sizeof(msg), "[BAUD: %d%s]\n", (int)g_BaudRate, g_FSKProportionalMode ? "*" : "");
     addFSKDisplayString(msg);
 }
 
@@ -2123,3 +2185,104 @@ static void CopyBlockDMA2D(uint32_t* src, uint32_t* dst, int width, int height) 
     hdma2d.Instance->NLR = (width << 16) | height;
     hdma2d.Instance->CR |= DMA2D_CR_START;
 }
+
+void Visualizer_GetFSKText(char* outBuf, uint16_t maxLen) {
+    if (!outBuf || maxLen == 0) return;
+    vTaskSuspendAll();
+    outBuf[0] = '\0';
+    uint16_t curLen = 0;
+    
+    // Output complete lines from oldest to newest
+    int startIdx = (g_RxLineCount < MAX_RX_LINES) ? 0 : g_RxLineHead;
+    for (int i = 0; i < g_RxLineCount; i++) {
+        int idx = (startIdx + i) % MAX_RX_LINES;
+        int lineLen = strlen(g_RxLines[idx]);
+        if (curLen + lineLen + 2 < maxLen) {
+            memcpy(outBuf + curLen, g_RxLines[idx], lineLen);
+            curLen += lineLen;
+            outBuf[curLen++] = '\n';
+            outBuf[curLen] = '\0';
+        }
+    }
+    // Append current in-progress line if any
+    if (g_CurrentLineIdx > 0 && curLen + g_CurrentLineIdx + 1 < maxLen) {
+        memcpy(outBuf + curLen, g_CurrentLineBuf, g_CurrentLineIdx);
+        curLen += g_CurrentLineIdx;
+        outBuf[curLen] = '\0';
+    }
+    xTaskResumeAll();
+}
+
+void Visualizer_GetStatsText(char* outBuf, uint16_t maxLen) {
+    if (!outBuf || maxLen == 0) return;
+    vTaskSuspendAll();
+    snprintf(outBuf, maxLen, "Baud: %d | Side: %c | Total: %d | Errors: %d", 
+             (int)g_BaudRate, g_TapeStats.currentSide, g_TapeStats.logLineCount, g_TapeStats.dataErrors);
+    xTaskResumeAll();
+}
+
+void Visualizer_GetLastLine(char* outBuf, uint16_t maxLen) {
+    if (!outBuf || maxLen == 0) return;
+    vTaskSuspendAll();
+    if (g_ReadyLineBuf[0] != '\0') {
+        strncpy(outBuf, g_ReadyLineBuf, maxLen - 1);
+        outBuf[maxLen - 1] = '\0';
+    } else if (g_CurrentLineIdx > 0 && g_CurrentLineBuf[0] != '\0') {
+        strncpy(outBuf, g_CurrentLineBuf, maxLen - 1);
+        outBuf[maxLen - 1] = '\0';
+    } else {
+        outBuf[0] = '\0';
+    }
+    xTaskResumeAll();
+}
+
+double Visualizer_GetMeasuredBaud(void) {
+    return (double)g_Modem.lastMeasuredBaud;
+}
+
+double Visualizer_GetSpeedError(void) {
+    if (g_Modem.lastMeasuredBaud > 0 && g_BaudRate > 0) {
+        return (double)((g_Modem.lastMeasuredBaud - g_BaudRate) * 100.0f / g_BaudRate);
+    }
+    return 0.0;
+}
+
+bool Visualizer_IsDCTMode(void) {
+    return g_TapeStats.isDctMode;
+}
+
+void Visualizer_SetDCTMode(bool enabled) {
+    g_TapeStats.isDctMode = enabled;
+}
+
+void Visualizer_ResetFSK(void) {
+    vTaskSuspendAll();
+    memset(g_FSKText, 0, sizeof(g_FSKText));
+    g_FSKTextLen = 0;
+    g_RxLineCount = 0;
+    g_RxLineHead = 0;
+    for (int i = 0; i < MAX_RX_LINES; i++) g_RxLines[i][0] = '\0';
+    memset(&g_TapeStats, 0, sizeof(g_TapeStats));
+    g_TapeStats.currentSide = 'A';
+    g_CurrentLineIdx = 0;
+    g_ReadyLineBuf[0] = '\0';
+    g_LineReady = false;
+    xTaskResumeAll();
+}
+
+bool Visualizer_IsProportionalMode(void) {
+    return g_FSKProportionalMode;
+}
+
+void Visualizer_SetProportionalMode(bool enabled) {
+    if (g_FSKProportionalMode != enabled) {
+        g_FSKProportionalMode = enabled;
+        initFSKModems();
+    }
+}
+
+void Visualizer_TransmitFSKText(const char* text) {
+    if (!text) return;
+    addFSKDisplayString(text);
+}
+

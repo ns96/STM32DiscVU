@@ -263,6 +263,30 @@ void DMA2_Stream3_IRQHandler(void)
   HAL_DMA_IRQHandler(&hdma_sdmmc1);
 }
 
+/**
+  * @brief This function handles USART6 global interrupt.
+  */
+extern UART_HandleTypeDef huart6;
+extern void ESP8266_RxCallback(uint8_t byte);
+
+void USART6_IRQHandler(void)
+{
+  if (huart6.Instance != NULL)
+  {
+    uint32_t isr = huart6.Instance->ISR;
+    if (isr & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE))
+    {
+      huart6.Instance->ICR = (USART_ICR_ORECF | USART_ICR_NCF | USART_ICR_FECF | USART_ICR_PECF);
+    }
+    if (isr & USART_ISR_RXNE)
+    {
+      uint8_t byte = (uint8_t)(huart6.Instance->RDR & 0xFF);
+      ESP8266_RxCallback(byte);
+    }
+  }
+}
+
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
+

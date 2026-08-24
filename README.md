@@ -21,8 +21,38 @@ DiscVU is a simple audio visualizer and FSK data decoder for the STM32F746-Disco
 This project is specifically designed for the **STM32F746G-Discovery** kit.
 
 - **Purchase from Mouser**: [STM32F746G-DISCO](https://mou.sr/3MRNQe1)
+- **Wi-Fi Shield (Optional)**: [RobotShop ESP8266 Wi-Fi Shield (RB-Mfk-14)](https://www.robotshop.com/) (Arduino Uno form-factor shield stacked directly onto the DISCO Arduino headers, communicating over USART6).
+  - *Jumper Configuration*: Ensure the jumpers are set to the default positions connecting `ESP_TX` / `ESP_RX` to digital pins **0 and 1** (hardware UART TX/RX on the Discovery Arduino headers).
 - **Audio Input**: Onboard MEMS microphones or Line-In via the 3.5mm jack.
-- **Storage**: MicroSD card (FAT32) for metadata database and mapping files.
+- **Storage**: MicroSD card (FAT32) for metadata database, mapping files, and Wi-Fi configuration.
+
+## 📡 Wi-Fi Configuration & HTTP API
+
+When an ESP8266 Wi-Fi shield is installed, DiscVU automatically launches an embedded HTTP REST API & telemetry server on port 80.
+
+### Wi-Fi Configuration (`/WIFI.TXT`)
+
+Create a `/WIFI.TXT` file in the root of the microSD card with your network credentials:
+
+```ini
+SSID=YourNetworkSSID
+PASS=YourNetworkPassword
+```
+
+*(If `/WIFI.TXT` is omitted, the firmware falls back to default credentials configured in `WiFiApp.h`)*.
+
+### HTTP Endpoints
+
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/info` | `GET` | **CassetteFlow Handshake**: Returns `DECODE <rx_text>\n` when in DCT mode or `PASS THROUGH\n` otherwise. Case-insensitive (`/INFO`). |
+| `/raw` or `/rawdct` | `GET` | **Live Streaming Stream**: Open-ended, real-time HTTP stream sending decoded FSK lines as they are demodulated. Sends `### NOCARRIER ###\n` every **1 second** when idle. |
+| `/api/status` | `GET` | **Telemetry (JSON)**: Returns real-time system metrics (CPU load, measured baud, speed error %, DCT mode, IP address, stats, and FSK log). |
+| `/` | `GET` | **Status Page / Mode Selector**: HTML status dashboard. Supports query parameters `?mode=decode` (enable DCT) and `?mode=pass` (pass-through). |
+| `/dct` | `GET` | Enables DCT mode and returns `DCT Mode Enabled\n`. |
+| `/mp3db`, `/tapedb`, `/create`, `/start`, `/stop`, `/play` | `GET` | CassetteFlow tape deck control and status endpoints. |
+| `/api/cmd` | `POST` | Executes JSON commands (e.g. `{"cmd": "reset"}`, `{"cmd": "dct_mode", "val": 1}`). |
+| `/api/tx` | `POST` | Transmits raw text via FSK modulation. |
 
 ## 💻 Software Setup & Compilation
 
@@ -54,6 +84,8 @@ This project is specifically designed for the **STM32F746G-Discovery** kit.
 ## 📁 Project Structure
 
 - `Core/Src/VisualizerApp.c`: Main application logic and rendering engine.
+- `Core/Src/WiFiApp.c`: Embedded HTTP REST server, `/raw` streaming, and CassetteFlow integration.
+- `Core/Src/ESP8266.c`: Low-level AT command driver for ESP8266 Wi-Fi shield over USART6.
 - `Core/Src/FSKDecoder.c`: Bell 202 FSK modem implementation.
 - `Core/Src/SimpleFFT.c`: Optimized FFT calculation.
 - `Core/Src/DatabaseManager.c`: Binary and text-based metadata lookup system.

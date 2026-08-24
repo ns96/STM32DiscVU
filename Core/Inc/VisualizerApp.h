@@ -49,7 +49,11 @@ extern bool g_SimulationMode;
 extern bool g_InputLineIn;
 extern bool g_ShowPCMF1;
 extern bool g_EnableAesthetics;
+extern bool g_FSKProportionalMode;
 extern volatile bool g_IsEncoding;
+extern int g_HeaderView; // 0: System Stats, 1: Wi-Fi Status/IP
+extern float g_BaudRate;
+extern int current_cpu_load;
 
 // Audio context needed for switching inputs
 extern int16_t audio_buffer[AUDIO_BUFFER_SIZE];
@@ -61,9 +65,21 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples);
 void FSK_Reset_Buffering_State(void);
 void addFSKDisplayString(const char* str);
 
-// FSK FIFO
+// FSK FIFO & Web Telemetry APIs
 void FSK_FIFO_Push(int16_t sample);
 int16_t FSK_FIFO_Pop(void);
 void FSK_FIFO_Reset(void);
+
+void Visualizer_GetFSKText(char* outBuf, uint16_t maxLen);
+void Visualizer_GetStatsText(char* outBuf, uint16_t maxLen);
+void Visualizer_GetLastLine(char* outBuf, uint16_t maxLen);
+double Visualizer_GetMeasuredBaud(void);
+double Visualizer_GetSpeedError(void);
+bool Visualizer_IsDCTMode(void);
+void Visualizer_SetDCTMode(bool enabled);
+bool Visualizer_IsProportionalMode(void);
+void Visualizer_SetProportionalMode(bool enabled);
+void Visualizer_ResetFSK(void);
+void Visualizer_TransmitFSKText(const char* text);
 
 #endif // VISUALIZER_APP_H

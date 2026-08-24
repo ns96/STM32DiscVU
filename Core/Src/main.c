@@ -32,6 +32,7 @@
 #include <math.h>
 #include "FSKModem.h"
 #include "VisualizerApp.h"
+#include "WiFiApp.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -132,6 +133,7 @@ static volatile uint8_t audio_ready = 0;
 
 osMessageQId modem_samples_queue_id;
 osThreadId modemTaskHandle;
+osThreadId wifiTaskHandle;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -287,6 +289,10 @@ int main(void)
   osThreadDef(modemTask, StartModemTask, osPriorityAboveNormal, 0, 1024);
   modemTaskHandle = osThreadCreate(osThread(modemTask), NULL);
   if (modemTaskHandle == NULL) printf("[ERROR] Modem Task Create FAILED (Out of Heap!)\r\n");
+
+  osThreadDef(wifiTask, StartWiFiTask, osPriorityNormal, 0, 1024);
+  wifiTaskHandle = osThreadCreate(osThread(wifiTask), NULL);
+  if (wifiTaskHandle == NULL) printf("[ERROR] WiFi Task Create FAILED (Out of Heap!)\r\n");
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -1958,6 +1964,9 @@ void StartDefaultTask(void const * argument)
   } else {
       printf("[FATFS] Mount OK\r\n");
   }
+
+  printf("[WIFI] Initializing Wi-Fi Config...\r\n");
+  WiFiApp_Init();
 
   printf("[LCD/AUDIO] Initializing...\r\n");
   Visualizer_Init();
