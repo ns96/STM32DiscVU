@@ -188,6 +188,28 @@ static void EscapeForJSON(const char* src, char* dst, uint16_t maxLen) {
     dst[d] = '\0';
 }
 
+// newlib-nano's printf/snprintf has floating-point support DISABLED unless the image is
+// linked with `-u _printf_float`. The link line uses --specs=nano.specs and does not pass
+// it, so every %f / %.1f / %.2f in this file emitted an EMPTY string rather than a number.
+// For /api/status that produced JSON such as "param_measured_baud":, which is invalid, so
+// JSON.parse() threw in the browser and the ENTIRE web UI stayed frozen at its initial
+// state - "Waiting for incoming FSK audio carrier..." and [NO CARRIER] - even while the
+// device was decoding perfectly and reporting "carrier":true with a full rx_text.
+// Rendering the decimals with integer maths avoids pulling in the float printf machinery
+// (several KB of flash plus a large per-call cost) and keeps the values numerically
+// identical to what the client already expects.
+static void FmtFixed(char* dst, size_t n, float v, int decimals) {
+    if (!dst || n == 0) return;
+    long scale = (decimals == 2) ? 100 : 10;
+    float scaled = v * (float)scale;
+    long rounded = (long)(scaled + ((scaled < 0.0f) ? -0.5f : 0.5f));
+    long whole = rounded / scale;
+    long frac  = rounded % scale;
+    if (frac < 0) frac = -frac;
+    if (decimals == 2) snprintf(dst, n, "%ld.%02ld", whole, frac);
+    else               snprintf(dst, n, "%ld.%ld",   whole, frac);
+}
+
 // Incoming Packet Dispatcher (Supports /info, /raw, /rawdct, /dct, /api/status, /api/cmd, /api/tx, etc.)
 static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, uint16_t len) {
     static char req[512];
@@ -288,6 +310,12 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
         Visualizer_GetStatsSnapshot(&snapshot);
         Visualizer_GetFSKText(s_RxTextRaw, sizeof(s_RxTextRaw));
         Visualizer_GetStatsText(s_StatsText, sizeof(s_StatsText));
+
+        // Pre-render the decimal fields - see FmtFixed() for why %f cannot be used here.
+        char mBaud[16], sErr[16], aErr[16], bErr[16], snr[16];
+        FmtFixed(mBaud, sizeof(mBaud), snapshot.lastMeasuredBaud, 1);
+        FmtFixed(sErr,  sizeof(sErr),  snapshot.speedError,       2);
+        FmtFixed(snr,   sizeof(snr),   snapshot.lastSNR,          1);
         EscapeForJSON(s_RxTextRaw, s_RxTextJson, sizeof(s_RxTextJson));
         EscapeForJSON(snapshot.lastLine, s_LastLineJson, sizeof(s_LastLineJson));
         EscapeForJSON(snapshot.metaFile, s_MetaFileJson, sizeof(s_MetaFileJson));
@@ -300,24 +328,26 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
 
         float sideAPerc = (snapshot.sideALineCount > 0) ? ((float)snapshot.sideAErrors * 100.0f / (float)snapshot.sideALineCount) : 0.0f;
         float sideBPerc = (snapshot.sideBLineCount > 0) ? ((float)snapshot.sideBErrors * 100.0f / (float)snapshot.sideBLineCount) : 0.0f;
+        FmtFixed(aErr, sizeof(aErr), sideAPerc, 1);
+        FmtFixed(bErr, sizeof(bErr), sideBPerc, 1);
 
         extern bool g_ShowFSKEncode;
 
         snprintf(s_JsonBody, sizeof(s_JsonBody),
             "{"
-            "\"param_cpu\":%d,\"param_baud\":%d,\"param_measured_baud\":%.1f,"
-            "\"param_speed_error\":%.2f,\"param_wf_pct\":0.0,\"param_wf_peak\":0.0,\"param_test\":%s,\"param_dct\":%s,"
+            "\"param_cpu\":%d,\"param_baud\":%d,\"param_measured_baud\":%s,"
+            "\"param_speed_error\":%s,\"param_wf_pct\":0.0,\"param_wf_peak\":0.0,\"param_test\":%s,\"param_dct\":%s,"
             "\"param_tape_scale\":%s,\"param_spk\":false,\"param_ip\":\"%s\",\"param_version\":\"v0.7.0\","
             "\"side\":\"%c\",\"timecode\":\"%s\",\"time_seconds\":%d,\"total_recs\":%d,\"data_errors\":%d,"
-            "\"len_errors\":%d,\"num_errors\":%d,\"stops\":%d,\"side_a_count\":%d,\"side_a_err\":%.1f,"
-            "\"side_b_count\":%d,\"side_b_err\":%.1f,\"carrier\":%s,\"snr\":%.1f,\"mode\":\"%s\","
+            "\"len_errors\":%d,\"num_errors\":%d,\"stops\":%d,\"side_a_count\":%d,\"side_a_err\":%s,"
+            "\"side_b_count\":%d,\"side_b_err\":%s,\"carrier\":%s,\"snr\":%s,\"mode\":\"%s\","
             "\"has_meta\":%s,\"meta_file\":\"%s\",\"now_playing\":\"%s\",\"meta_hash\":\"%s\",\"meta_dur\":\"%02d:%02d\",\"meta_bitrate\":%d,"
             "\"last_record\":\"%s\",\"rx_text\":\"%s\",\"stats_text\":\"%s\""
             "}",
             current_cpu_load,
             (int)g_BaudRate,
-            (double)snapshot.lastMeasuredBaud,
-            (double)snapshot.speedError,
+            mBaud,
+            sErr,
             g_ShowFSKEncode ? "true" : "false",
             snapshot.isDctMode ? "true" : "false",
             Visualizer_IsProportionalMode() ? "true" : "false",
@@ -331,11 +361,11 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
             snapshot.invalidCharacterErrors,
             snapshot.totalStops,
             snapshot.sideALineCount,
-            (double)sideAPerc,
+            aErr,
             snapshot.sideBLineCount,
-            (double)sideBPerc,
+            bErr,
             snapshot.carrier ? "true" : "false",
-            (double)snapshot.lastSNR,
+            snr,
             snapshot.isDctMode ? "DCT AUTO" : "GENERIC",
             snapshot.hasMetadata ? "true" : "false",
             s_MetaFileJson,

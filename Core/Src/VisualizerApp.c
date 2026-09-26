@@ -764,6 +764,25 @@ static uint16_t crc16_ccitt(uint8_t *bits, int offset, int len) {
     return crc;
 }
 
+// newlib-nano's printf/snprintf has floating-point support DISABLED unless the image is
+// linked with `-u _printf_float`. The link line uses --specs=nano.specs and does not pass
+// it, so every %f / %.1f / %.2f silently emitted an EMPTY string - e.g. the [FSK DIAG] line
+// printed "SNR:" with no value. Decimal rendering is done with integer maths instead, which
+// avoids pulling in the float printf machinery (several KB of flash plus a large per-call
+// cost). WiFiApp.c carries an identical local copy; they are deliberately duplicated so
+// neither translation unit depends on the other for a formatting shim.
+static void FmtFixed(char* dst, size_t n, float v, int decimals) {
+    if (!dst || n == 0) return;
+    long scale = (decimals == 2) ? 100 : 10;
+    float scaled = v * (float)scale;
+    long rounded = (long)(scaled + ((scaled < 0.0f) ? -0.5f : 0.5f));
+    long whole = rounded / scale;
+    long frac  = rounded % scale;
+    if (frac < 0) frac = -frac;
+    if (decimals == 2) snprintf(dst, n, "%ld.%02ld", whole, frac);
+    else               snprintf(dst, n, "%ld.%ld",   whole, frac);
+}
+
 // --- UI State ---
 #define MAX_BUTTONS 7
 static Button buttons[MAX_BUTTONS];
@@ -1349,11 +1368,13 @@ void Visualizer_Update(void) {
         if (diagNow && g_ShowFSK) {
             float mMag = Filter_GetMag(&g_Modem.filterMark);
             float sMag = Filter_GetMag(&g_Modem.filterSpace);
-            printf("[FSK DIAG] Baud:%d | Sig:%d%% | M:%d S:%d | SNR:%f | Carr:%d\r\n", 
+            char snrTxt[16];
+            FmtFixed(snrTxt, sizeof(snrTxt), g_Modem.lastSNR, 1);
+            printf("[FSK DIAG] Baud:%d | Sig:%d%% | M:%d S:%d | SNR:%s | Carr:%d\r\n", 
                    (int)g_Modem.cfg.baudRate, 
                    (int)(g_MaxSignalLevel * 100.0f), 
                    (int)(mMag * 100.0f), (int)(sMag * 100.0f),
-                   g_Modem.lastSNR, 
+                   snrTxt, 
                    g_Modem.carrier);
              g_MaxSignalLevel = 0.0f; // Reset peak hold
         }
@@ -2263,9 +2284,12 @@ static void handleTouch() {
                 // Right Button: Toggle FSK Proportional Tape-Speed Scaling Mode
                 g_FSKProportionalMode = !g_FSKProportionalMode;
                 initFSKModems();
-                printf("[UI] Header Right Tapped -> FSK Tape Scaling: %s (Baud: %d, M: %.1f Hz, S: %.1f Hz)\r\n", 
+                char mHzTxt[16], sHzTxt[16];
+                FmtFixed(mHzTxt, sizeof(mHzTxt), g_Modem.cfg.freqMark, 1);
+                FmtFixed(sHzTxt, sizeof(sHzTxt), g_Modem.cfg.freqSpace, 1);
+                printf("[UI] Header Right Tapped -> FSK Tape Scaling: %s (Baud: %d, M: %s Hz, S: %s Hz)\r\n", 
                        g_FSKProportionalMode ? "ACTIVE (Proportional 1200Hz base)" : "INACTIVE (Bell Standards)",
-                       (int)g_BaudRate, g_Modem.cfg.freqMark, g_Modem.cfg.freqSpace);
+                       (int)g_BaudRate, mHzTxt, sHzTxt);
                 if (g_ShowFSK) {
                     char msg[64];
                     if (g_FSKProportionalMode) {
@@ -2497,8 +2521,11 @@ static void initFSKModems(void) {
     txCfg.sampleRate = 48000.0f;
     FSK_Modem_Init(&g_TxModem, txCfg);
     
-    printf("FSK: Modems Init to %d baud (Mark: %.1f Hz, Space: %.1f Hz, TapeScale: %s, RX=12k, TX=48k)\r\n", 
-           (int)g_BaudRate, g_Modem.cfg.freqMark, g_Modem.cfg.freqSpace,
+    char mHzTxt[16], sHzTxt[16];
+    FmtFixed(mHzTxt, sizeof(mHzTxt), g_Modem.cfg.freqMark, 1);
+    FmtFixed(sHzTxt, sizeof(sHzTxt), g_Modem.cfg.freqSpace, 1);
+    printf("FSK: Modems Init to %d baud (Mark: %s Hz, Space: %s Hz, TapeScale: %s, RX=12k, TX=48k)\r\n",
+           (int)g_BaudRate, mHzTxt, sHzTxt,
            g_FSKProportionalMode ? "ON" : "OFF");
 }
 

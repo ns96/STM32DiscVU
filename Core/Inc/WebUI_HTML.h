@@ -4,6 +4,16 @@
 /*
  * WebUI_HTML.h - High-Speed Minified Embedded Telemetry & Remote
  * Single-page application optimized for fast UART transfer (~4KB)
+ *
+ * Poll cadence: the page re-arms itself with setTimeout(poll, N) only AFTER the previous
+ * /api/status request finishes, so the real update period is N + the request time.
+ * Measured request time is ~320 ms, because serving it takes several AT-command round
+ * trips to the ESP8266 over the blocking 115200 UART. N was 800 ms (about 1.1 s between
+ * updates) and is now 300 ms (about 0.6 s).
+ * Do not shorten N much further: the requests cannot overlap by design, so polling faster
+ * than the link can serve only queues work and makes updates LESS regular, not faster.
+ *
+ * Keep comments OUT of the HTML string itself - every byte is transferred to the browser.
  */
 
 static const char WEB_UI_HTML[] =
@@ -166,7 +176,7 @@ static const char WEB_UI_HTML[] =
 "      stateSpk=d.param_spk;stateTest=d.param_test;stateDct=d.param_dct;"
 "    }"
 "  }catch(e){console.error(e);}"
-"  finally{updating=false;setTimeout(poll,800);}"
+"  finally{updating=false;setTimeout(poll,300);}"
 "}"
 "async function sendTx(){"
 "  const inp=document.getElementById('tx-in'),val=inp.value;"
