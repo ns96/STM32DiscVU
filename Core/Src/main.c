@@ -195,6 +195,16 @@ int main(void)
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
+  /* Enable the Cortex-M7 L1 instruction cache.
+     The ART accelerator caches flash lines, but without the core's I-cache every
+     instruction fetch that misses still pays the full flash latency - now 7 wait states at
+     216 MHz. Text rendering is by far the most instruction-heavy code per byte written
+     (measured ~170 cycles per pixel against 31 for a plain store), so this is the cheapest
+     known remaining win.
+     The D-Cache is deliberately left OFF: the framebuffer is non-cacheable SDRAM and
+     partial-cache-line pixel writes would suffer read-modify-write amplification. */
+  SCB_EnableICache();
+
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
@@ -204,6 +214,31 @@ int main(void)
 
   MX_USART1_UART_Init();
   printf("\r\n\r\n--- STM32 USART1 VCP INITIALIZED (115200) ---\r\n");
+
+  /* Enable the ART accelerator (flash prefetch + instruction/data cache).
+     FLASH_ACR.ARTEN is DISABLED at reset on STM32F7, and neither CubeMX nor the HAL turns
+     it on - HAL_RCC_ClockConfig() only programs the latency bits. Without it every flash
+     access pays the full 7 wait states at 216 MHz.
+     The signature of this is in the [BENCH] numbers: a trivial sequential store loop
+     measures ~32 cycles per pixel, far more than its ~6 instructions per iteration can
+     justify, and every hot loop in the firmware is slow by roughly the same factor (the
+     text renderer, drawPCMF1's 411-store row loop, the FFT). It also explains why every
+     optimisation that worked only ever won by DELETING whole operations rather than by
+     making a loop faster.
+     Enabled here rather than in SystemClock_Config() because the result needs a printf to
+     report it. Flash is read-only to the application, so the ART's data cache cannot go
+     stale, and enabling it does not disturb any DMA. */
+  {
+    uint32_t acrBefore = FLASH->ACR;
+    __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
+    __HAL_FLASH_ART_ENABLE();
+    printf("[ACR] before=%08lX after=%08lX (PRFTEN:%lu ARTEN:%lu LATENCY:%lu)\r\n",
+           (unsigned long)acrBefore,
+           (unsigned long)FLASH->ACR,
+           (unsigned long)((FLASH->ACR >> 8) & 1u),   /* PRFTEN, bit 8 */
+           (unsigned long)((FLASH->ACR >> 9) & 1u),   /* ARTEN,  bit 9 */
+           (unsigned long)(FLASH->ACR & 0xFu));       /* LATENCY, bits 3:0 */
+  }
 
   /* Configure the peripherals common clocks */
   PeriphCommonClock_Config();
@@ -337,8 +372,12 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  // PLLN=432 with PLLM=25 and PLLP=2 gives 216 MHz - the STM32F746 maximum - and
+  // 432/9 = 48 MHz on PLLQ, which is the correct USB clock. The previous PLLN=400 ran the
+  // core at 200 MHz and gave PLLQ only 44.4 MHz, out of spec for USB.
+  // PLLM is unchanged, so PLLSAI (LTDC + SAI2 audio) and CLK48 (SDMMC) are unaffected.
   RCC_OscInitStruct.PLL.PLLM = 25;
-  RCC_OscInitStruct.PLL.PLLN = 400;
+  RCC_OscInitStruct.PLL.PLLN = 432;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -362,7 +401,12 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_6) != HAL_OK)
+  // FLASH_LATENCY_7 is required at 216 MHz / VOS1 (6 wait states only covers up to 210 MHz;
+  // it was correct for the old 200 MHz). Getting this wrong makes flash reads unreliable.
+  // UART and SPI recompute their dividers from HAL_RCC_GetPCLKxFreq(); I2C1's TIMINGR is a
+  // fixed value computed for the old 50 MHz PCLK1 (now 54 MHz), so that bus runs ~8% fast,
+  // which is harmless for the touch controller and codec.
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1903,7 +1947,7 @@ void StartModemTask(void const * argument) {
         ModemChunk rxChunk;
         if (xQueueReceive(modem_samples_queue_id, &rxChunk, portMAX_DELAY) == pdTRUE) {
             static uint32_t last_rx_debug = 0;
-            if (HAL_GetTick() - last_rx_debug > 2000) {
+            if (HAL_GetTick() - last_rx_debug > 10000) {
                  float pwr = 0.0f;
                  for(int k=0; k<MODEM_CHUNK_SIZE; k++) {
                      float v = rxChunk.samples[k];
@@ -1976,10 +2020,16 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   uint32_t last_heartbeat = 0;
   printf("StartDefaultTask: Runtime Loop Started.\r\n");
+  extern void Visualizer_ProfMain(uint32_t cycles);
   for(;;)
   {
-    if (HAL_GetTick() - last_heartbeat > 2000) {
-        printf("Heartbeat: StartDefaultTask is running... (audio_ready: %d)\r\n", audio_ready);
+    uint32_t t_loop = DWT->CYCCNT;
+
+    // This printf blocks ~180 us per character on the 115200 baud console, so every-2s
+    // output of a long line was costing ~10 ms of wall time and showing up as a periodic
+    // stall. Keep the liveness check but make it cheap.
+    if (HAL_GetTick() - last_heartbeat > 10000) {
+        printf("[MAIN] alive, audio_ready:%d\r\n", audio_ready);
         last_heartbeat = HAL_GetTick();
     }
 
@@ -1995,15 +2045,12 @@ void StartDefaultTask(void const * argument)
         Visualizer_ProcessAudio(pBuf, AUDIO_BUFFER_SIZE/2);
     }
     
-    static uint32_t last_update = 0;
-    if (HAL_GetTick() - last_update > 5000) {
-        printf("[DEBUG] Main Loop Heartbeat.\r\n");
-        last_update = HAL_GetTick();
-    }
-
+    // No artificial delay: Visualizer_Update() is paced by the LTDC vertical-blanking
+    // buffer flip at the end of every frame, which locks this loop to the panel refresh.
+    // (The old osDelay(10) here plus the 5 ms one inside Visualizer_Update() added 15 ms of
+    //  dead time per frame - 20% of an 86 ms frame - for no benefit.)
+    Visualizer_ProfMain(DWT->CYCCNT - t_loop);
     Visualizer_Update();
-    
-    osDelay(10); // Aggressively reduce CPU load
   }
   /* USER CODE END 5 */
 }
@@ -2032,6 +2079,51 @@ void MPU_Config(void)
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /* Region 1: external SDRAM (framebuffers, waterfall ring, side maps, audio DB).
+     Region 0 covers 0x60000000-0xDFFFFFFF as Strongly-Ordered (TEX=0, C=0, B=0). A
+     higher-numbered region wins where they overlap, so this 16 MB window - exactly the
+     MT48LC4M32B2 fitted to the STM32F746G-DISCO (bank 1 only) - overrides it.
+
+     TEX=001, C=0, B=0, S=0 gives Normal, Outer and Inner Non-cacheable, non-shareable.
+
+     HISTORY - this region has been through three configurations, all measured:
+       1. C=0 B=0 S=1 (original). Benchmark measured ~32 cycles per 32-bit pixel store
+          (about 27 MB/s) while DMA2D reached ~122 MB/s on the same memory. The S bit was
+          cleared because shareability forces strict ordering and there is only one bus
+          master in the CPU domain.
+       2. C=1 B=1 S=0 (Normal, Write-Back no write-allocate). Intended to let stores retire
+          into the store buffer. It made things dramatically WORSE: drawPCMF1() (82,200
+          pixel stores) went to 50.6 ms per frame = ~133 cycles/pixel, roughly 4x the cost
+          measured in (1), and PCM-F1 mode collapsed to 15 fps. With the D-Cache disabled,
+          a cacheable attribute appears to push stores down a path that neither caches nor
+          buffers usefully, so it is a pessimal choice here.
+       3. C=0 B=0 S=0 (this). Non-cacheable like (1) but keeps the non-shareable ordering
+          benefit.
+
+     LESSON: do not set the cacheable attribute on SDRAM while the D-Cache is disabled.
+     The D-Cache is never enabled, so no cache maintenance is required and the LTDC and
+     DMA2D keep observing every byte the CPU writes. Because a DMA master can still race
+     the store buffer, a __DSB() is kept wherever the CPU writes a buffer a DMA master then
+     reads - see CopyBlockDMA2D().
+
+     LATENT TRAP: if SCB_EnableDCache() is ever called, this region becomes genuinely
+     cached and every SCB_*Cache*By_Addr() call that was removed for speed must come back,
+     or the LTDC will scan out stale pixels. */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
+  MPU_InitStruct.BaseAddress = ((uint32_t)0xC0000000);
+  MPU_InitStruct.Size = MPU_REGION_SIZE_16MB;
+  MPU_InitStruct.SubRegionDisable = 0x00;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL1;   /* Normal memory */
+  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 

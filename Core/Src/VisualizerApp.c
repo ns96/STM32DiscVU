@@ -298,7 +298,18 @@ static void updateActiveGain() {
 }
 
 // --- Buffers & Double Buffering State ---
-static uint32_t fb_addresses[2] = { LCD_FB_START_ADDRESS, LCD_FB_START_ADDRESS + LCD_FB_OFFSET };
+// Triple buffering. Each ARGB8888 480x272 frame needs 522,240 bytes, so a 512 KB stride
+// fits three buffers inside the first 2 MB of SDRAM, safely below the waterfall ring at
+// 0xC0200000 (which is why FB_STRIDE is deliberately not used for the waterfall address).
+// With three buffers the buffer being rendered is never the one on screen, so the render
+// loop no longer has to stall waiting for vertical blanking.
+#define FB_STRIDE (512u * 1024u)
+#define FB_COUNT  3
+static uint32_t fb_addresses[FB_COUNT] = {
+    LCD_FB_START_ADDRESS,
+    LCD_FB_START_ADDRESS + FB_STRIDE,
+    LCD_FB_START_ADDRESS + 2u * FB_STRIDE
+};
 #define WFALL_FB_ADDRESS (LCD_FB_START_ADDRESS + 2 * LCD_FB_OFFSET)
 #define WFALL_WIDTH  480
 #define WFALL_HEIGHT 200 // UI_FOOTER_Y - UI_HEADER_H
@@ -311,6 +322,57 @@ static uint32_t cpu_baseline = 0;
 static uint32_t last_idle_val = 0;
 static uint32_t last_cpu_tick = 0;
 int current_cpu_load = 0;
+
+// --- Frame Timing / Frame-Rate-Independent Animation ---
+// Every animation constant in this file (bar attack/decay, peak decay, peak-hold
+// length, VU decay, waterfall scroll, simulation speed) is stored as a "per rendered
+// frame" value. They were tuned for the ~30 fps loop that the fixed osDelay() calls in
+// StartDefaultTask used to produce. Now that the loop runs at the panel refresh rate
+// they are rescaled by the measured frame period so the on-screen motion is unchanged.
+//
+// ANIM_REF_FRAME_MS is the frame period those constants were tuned at. It is the ONE
+// knob to adjust if the animation now feels faster or slower than before:
+//     33 ms = 30 fps (default)   25 ms = 40 fps   20 ms = 50 fps   17 ms = 60 fps
+#define ANIM_REF_FRAME_MS 33.0f
+
+static uint32_t g_LastFrameTick = 0;
+static float    g_FrameDtMs     = ANIM_REF_FRAME_MS; // measured frame period, milliseconds
+static float    g_AnimScale     = 1.0f;              // g_FrameDtMs / ANIM_REF_FRAME_MS
+static float    g_AlphaAttack   = 0.70f;             // spectrum bar attack, frame-rate corrected
+static float    g_AlphaDecay    = 0.10f;             // spectrum bar decay,  frame-rate corrected
+static float    g_VUDecayScaled = 0.80f;             // VU meter decay,     frame-rate corrected
+
+// --- Temporary frame-stage profiler -------------------------------------------
+// Accumulates microseconds per stage and reports them once per second, so frame-rate
+// work is driven by measurements rather than guesses. Safe to delete when done.
+// The reported numbers are TOTALS PER SECOND (not per frame): if they add up to far
+// less than 1000000 the loop is waiting on something, not short of CPU.
+enum {
+    PROF_TOUCH = 0, PROF_CLEAR, PROF_FFT,
+    PROF_VIZWAIT, PROF_VIZ, PROF_HDRFILL, PROF_HDRPRINT, PROF_HDRTEXT,
+    PROF_VU, PROF_BTN, PROF_FLIP, PROF_MAIN, PROF_COUNT
+};
+static uint32_t g_ProfAcc[PROF_COUNT];
+static uint32_t g_ProfMark = 0;
+static uint32_t g_ProfCyclesPerUs = 216;
+static bool     g_ProfEnabled = false;
+
+static inline void ProfBegin(void) {
+    if (g_ProfEnabled) g_ProfMark = DWT->CYCCNT;
+}
+static inline void ProfStage(int i) {
+    if (!g_ProfEnabled) return;
+    uint32_t now = DWT->CYCCNT;
+    g_ProfAcc[i] += (now - g_ProfMark);
+    g_ProfMark = now;
+}
+
+// Called from the main loop with the cycles spent OUTSIDE Visualizer_Update(), so the
+// frame period can be fully accounted for. Anything left over after this is elsewhere
+// (ISRs, other FreeRTOS tasks).
+void Visualizer_ProfMain(uint32_t cycles) {
+    g_ProfAcc[PROF_MAIN] += cycles;
+}
 
 // --- Audio / Viz State ---
 static float vReal[FFT_SIZE];
@@ -330,10 +392,12 @@ static float peakR = 0.0f;
 static uint8_t fft_mag_sim[64]; 
 
 // --- Peak Hold State ---
+// Hold counters are floats counted down by g_AnimScale so the hold *time* stays
+// constant when the frame rate changes.
 static float g_SpectrumPeaks[128];
-static uint8_t g_PeakHoldCount[128];
+static float g_PeakHoldCount[128];
 static float g_VUPeaks[2]; // 0=L, 1=R
-static uint8_t g_VUPeakHoldCount[2];
+static float g_VUPeakHoldCount[2];
 
 // --- Database & Metadata ---
 static AudioInfo g_CurrentTrack;
@@ -430,11 +494,11 @@ static int getLogBarHeight(float* fftData, int barIdx, int maxH, float gain, con
     float current_level = g_BarLevels[stateIdx];
     
     if (target_h > current_level) {
-        // Fast Attack
-        current_level = (target_h * 0.7f) + (current_level * 0.3f);
+        // Fast Attack (coefficient corrected for the measured frame period)
+        current_level = (target_h * g_AlphaAttack) + (current_level * (1.0f - g_AlphaAttack));
     } else {
-        // Slow Decay (Gravity)
-        current_level = (target_h * 0.10f) + (current_level * 0.90f);
+        // Slow Decay / Gravity (coefficient corrected for the measured frame period)
+        current_level = (target_h * g_AlphaDecay) + (current_level * (1.0f - g_AlphaDecay));
     }
     
     g_BarLevels[stateIdx] = current_level;
@@ -734,6 +798,9 @@ static void initSpectrumLUT(void) {
     }
 }
 
+/* Retained as a CPU fallback / reference. All bar, segment and peak fills now go through
+   the DMA2D engine, so this is currently unused - the attribute keeps -Wall quiet. */
+__attribute__((unused))
 static void FillRectCPU(uint32_t* fb, int x, int y, int w, int h, uint32_t color) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -750,6 +817,119 @@ static void FillRectCPU(uint32_t* fb, int x, int y, int w, int h, uint32_t color
 }
 
 // --- Initialization ---
+
+// Temporary: measure how expensive a CPU store to the framebuffer actually is, and how
+// long the DMA2D fills take, so the frame profile can be interpreted against facts rather
+// than assumptions. Delete together with the profiler.
+static void Visualizer_Bench(void) {
+    printf("[BENCH] SystemCoreClock=%u Hz  HCLK=%u Hz  PCLK1=%u Hz\r\n",
+           (unsigned)SystemCoreClock,
+           (unsigned)HAL_RCC_GetHCLKFreq(),
+           (unsigned)HAL_RCC_GetPCLK1Freq());
+
+    volatile uint32_t* fb = (volatile uint32_t*)fb_addresses[1];
+    const uint32_t N = 8192;
+    uint32_t c0, c1;
+
+    /* (0) Execution-speed calibration. This one line is worth more than any amount of
+           reasoning about the memory system, and it is why the [BENCH] numbers below were
+           confusing for so long.
+           The firmware used to be built with -Os. Under -Os these loops measured
+           14 (stack) / 31 (SRAM) / 38 (SDRAM) cycles per iteration, and every hot loop in
+           the firmware was ~5x slower than its instruction count justified - which sent a
+           long investigation chasing MPU attributes, cacheability, the ART accelerator and
+           SDRAM write paths, none of which were ever the problem.
+           Under -O2 the same loops measure 2 / 5 / 7. stack=2 is the theoretical floor, and
+           SDRAM costing only 2 cycles more than SRAM shows the memory system is fine.
+           KEEP THIS: it costs one boot-time printf and it instantly reveals whether the
+           build is behaving like an optimised build.
+           If these numbers ever regress toward 14/31/38, check the Optimization Level in
+           Project Properties -> C/C++ Build -> Settings -> MCU/MPU GCC Compiler before
+           suspecting any hardware subsystem. */
+    {
+        volatile uint32_t sink = 0;
+        static volatile uint32_t calBuf[1024];
+        const uint32_t CN = 50000;
+        uint32_t k, cAlu, cSram, cSdram;
+
+        c0 = DWT->CYCCNT;
+        for (k = 0; k < CN; k++) sink = k;
+        c1 = DWT->CYCCNT;
+        cAlu = (c1 - c0) / CN;
+
+        c0 = DWT->CYCCNT;
+        for (k = 0; k < CN; k++) calBuf[k & 1023u] = k;
+        c1 = DWT->CYCCNT;
+        cSram = (c1 - c0) / CN;
+
+        c0 = DWT->CYCCNT;
+        for (k = 0; k < CN; k++) fb[k & (N - 1u)] = k;
+        c1 = DWT->CYCCNT;
+        cSdram = (c1 - c0) / CN;
+
+        printf("[CAL] cyc/iter  stack=%u  sram=%u  sdram=%u\r\n",
+               (unsigned)cAlu, (unsigned)cSram, (unsigned)cSdram);
+    }
+
+    /* (1) Sequential stores - the best case for the memory system */
+    c0 = DWT->CYCCNT;
+    for (uint32_t i = 0; i < N; i++) fb[i] = 0x11223344u;
+    c1 = DWT->CYCCNT;
+    uint32_t seqCyc = (c1 - c0) / N;
+
+    /* (2) Glyph-like pattern: 8 adjacent pixels (one font row) then jump one scanline,
+           exactly how DrawChar() walks the framebuffer. */
+    uint32_t idx = 0;
+    c0 = DWT->CYCCNT;
+    for (uint32_t i = 0; i < N; i += 8) {
+        fb[idx + 0] = 0x55667788u; fb[idx + 1] = 0x55667788u;
+        fb[idx + 2] = 0x55667788u; fb[idx + 3] = 0x55667788u;
+        fb[idx + 4] = 0x55667788u; fb[idx + 5] = 0x55667788u;
+        fb[idx + 6] = 0x55667788u; fb[idx + 7] = 0x55667788u;
+        idx += 480;                              /* one scanline down */
+        if (idx >= 480u * 260u) idx = 0;
+    }
+    c1 = DWT->CYCCNT;
+    uint32_t glyphCyc = (c1 - c0) / N;
+
+    printf("[BENCH] fb store: sequential=%u cyc/px  glyph-style=%u cyc/px\r\n",
+           (unsigned)seqCyc, (unsigned)glyphCyc);
+
+    /* (3) One header string, exactly as drawn every frame */
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetBackColor(LCD_COLOR_BLUE);
+    c0 = DWT->CYCCNT;
+    BSP_LCD_DisplayStringAt(10, 7, (uint8_t*)"DiscVU 48kHz / L:045% R:052% CPU:90% FPS:10", LEFT_MODE);
+    c1 = DWT->CYCCNT;
+    printf("[BENCH] header string(44ch) = %u cyc = %u us\r\n",
+           (unsigned)(c1 - c0), (unsigned)((c1 - c0) / g_ProfCyclesPerUs));
+
+    /* (4) DMA2D register-to-memory fill of the header bar */
+    c0 = DWT->CYCCNT;
+    FillRectDMA2D((uint32_t*)fb_addresses[1], 0, 0, 480, UI_HEADER_H, LCD_COLOR_BLUE);
+    while (hdma2d.Instance->CR & DMA2D_CR_START);
+    c1 = DWT->CYCCNT;
+    printf("[BENCH] DMA2D 480x30 header fill = %u cyc = %u us\r\n",
+           (unsigned)(c1 - c0), (unsigned)((c1 - c0) / g_ProfCyclesPerUs));
+
+    /* (5) DMA2D fill the size of the visualiser clear */
+    c0 = DWT->CYCCNT;
+    FillRectDMA2D((uint32_t*)fb_addresses[1], 0, UI_VIZ_TOP, 480, UI_VIZ_BOTTOM - UI_VIZ_TOP, LCD_COLOR_BLACK);
+    while (hdma2d.Instance->CR & DMA2D_CR_START);
+    c1 = DWT->CYCCNT;
+    printf("[BENCH] DMA2D 480x200 clear = %u cyc = %u us\r\n",
+           (unsigned)(c1 - c0), (unsigned)((c1 - c0) / g_ProfCyclesPerUs));
+
+    /* (6) CopyBlockDMA2D of one waterfall row band */
+    c0 = DWT->CYCCNT;
+    CopyBlockDMA2D((uint32_t*)WFALL_FB_ADDRESS, (uint32_t*)fb_addresses[1], WFALL_WIDTH, 200);
+    while (hdma2d.Instance->CR & DMA2D_CR_START);
+    c1 = DWT->CYCCNT;
+    printf("[BENCH] DMA2D 480x200 M2M copy = %u cyc = %u us\r\n",
+           (unsigned)(c1 - c0), (unsigned)((c1 - c0) / g_ProfCyclesPerUs));
+}
+
 void Visualizer_Init(void) {
     uint8_t status;
     
@@ -781,8 +961,7 @@ void Visualizer_Init(void) {
     uint32_t bgColor = wfall_lut[0];
     uint32_t* ptr = (uint32_t*)WFALL_FB_ADDRESS;
     for(int i=0; i<WFALL_WIDTH * WFALL_HEIGHT; i++) ptr[i] = bgColor;
-    // Commit to SDRAM so DMA2D doesn't see garbage on first scroll
-    SCB_CleanDCache_by_Addr((uint32_t*)WFALL_FB_ADDRESS, WFALL_WIDTH * WFALL_HEIGHT * 4);
+    // (no D-Cache commit needed: this SDRAM is non-cacheable and the D-Cache is disabled)
 
     // Calibrate CPU baseline (idle ticks over 100ms)
     printf("VisualizerApp: Calibrating CPU...\r\n");
@@ -845,10 +1024,33 @@ void Visualizer_Init(void) {
         // DBM is static/global, so it naturally stays uninitialized (empty index)
     }
 
-    // Final Cleanup: Clear screen one more time to Layer 0 before visualizer loop starts
-    // This ensures no artifacts like "LLoading" remain.
+    // Enable the DWT cycle counter for the frame-stage profiler and boot benchmark
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = 0xC5ACCE55u;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    g_ProfEnabled = (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0;
+    g_ProfCyclesPerUs = SystemCoreClock / 1000000u;
+    if (g_ProfCyclesPerUs == 0) g_ProfCyclesPerUs = 216;
+    printf("VisualizerApp: DWT profiler %s (cycles/us = %u)\r\n",
+           g_ProfEnabled ? "ON" : "OFF", (unsigned)g_ProfCyclesPerUs);
+
+    Visualizer_Bench();
+
+    // Final Cleanup: clear BOTH framebuffers before the visualiser loop starts.
+    // The per-frame renderer no longer clears the whole screen, so every row that is not
+    // repainted every frame (the footer below the button strip) must start black in both.
+    // This also erases whatever the benchmark just wrote.
     BSP_LCD_Clear(LCD_COLOR_BLACK);
-    
+    for (int b = 0; b < FB_COUNT; b++) {
+        FillRectDMA2D((uint32_t*)fb_addresses[b], 0, 0, 480, 272, LCD_COLOR_BLACK);
+    }
+    while (hdma2d.Instance->CR & DMA2D_CR_START);
+
+    // Start the frame clock here so the first Visualizer_Update() sees a normal frame
+    // period instead of the whole time spent in initialisation.
+    g_LastFrameTick = HAL_GetTick();
+
     printf("VisualizerApp: Init sequence complete.\r\n");
 }
 
@@ -856,32 +1058,40 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
     extern volatile bool g_IsEncoding;
     if (g_IsEncoding) g_SimulationMode = false; // Force real view during encoding
 
-    // PCM-F1 Ring Buffer (Always store raw samples for bit-stream visualization)
+    // PCM-F1 ring buffer - raw samples for the bit-stream view. It is only ever READ by
+    // drawPCMF1(), i.e. only when that view is on screen.
+    // In simulation mode this loop is the only place that calls sinf()/cosf() PER SAMPLE,
+    // and on hardware each of those costs ~3 us, so the fill was ~2048 transcendental calls
+    // per frame = ~6 ms of every frame - for a view that is normally not displayed.
+    // Skip the buffer entirely unless the PCM-F1 view is active. When it is switched on the
+    // ring refills within a few audio buffers (~85 ms) and the display is correct from then.
     uint32_t step = 4;
-    for (uint32_t i = 0; i < samples; i += step) {
-        int16_t sL, sR;
-        if (g_SimulationMode && !g_IsEncoding) {
-            static float p = 0.0f;
-            sL = (int16_t)(sinf(p) * 16383.0f);
-            sR = (int16_t)(cosf(p * 0.9f) * 16383.0f);
-            p += 0.05f; 
-            if (p > 6.283185f) p -= 6.283185f;
-        } else {
-            int32_t sL_sum = (int32_t)inBuf[i] + (int32_t)inBuf[i + 1];
-            int32_t sR_sum = (int32_t)inBuf[i + 2] + (int32_t)inBuf[i + 3];
-            // Clamp to 16-bit
-            if (sL_sum > 32767) sL_sum = 32767; else if (sL_sum < -32768) sL_sum = -32768;
-            if (sR_sum > 32767) sR_sum = 32767; else if (sR_sum < -32768) sR_sum = -32768;
-            sL = (int16_t)sL_sum;
-            sR = (int16_t)sR_sum;
+    if (g_ShowPCMF1) {
+        for (uint32_t i = 0; i < samples; i += step) {
+            int16_t sL, sR;
+            if (g_SimulationMode && !g_IsEncoding) {
+                static float p = 0.0f;
+                sL = (int16_t)(sinf(p) * 16383.0f);
+                sR = (int16_t)(cosf(p * 0.9f) * 16383.0f);
+                p += 0.05f;
+                if (p > 6.283185f) p -= 6.283185f;
+            } else {
+                int32_t sL_sum = (int32_t)inBuf[i] + (int32_t)inBuf[i + 1];
+                int32_t sR_sum = (int32_t)inBuf[i + 2] + (int32_t)inBuf[i + 3];
+                // Clamp to 16-bit
+                if (sL_sum > 32767) sL_sum = 32767; else if (sL_sum < -32768) sL_sum = -32768;
+                if (sR_sum > 32767) sR_sum = 32767; else if (sR_sum < -32768) sR_sum = -32768;
+                sL = (int16_t)sL_sum;
+                sR = (int16_t)sR_sum;
+            }
+            int32_t scaledL = (int32_t)(sL * g_PCMF1Gain);
+            int32_t scaledR = (int32_t)(sR * g_PCMF1Gain);
+            if (scaledL > 32767) scaledL = 32767; else if (scaledL < -32768) scaledL = -32768;
+            if (scaledR > 32767) scaledR = 32767; else if (scaledR < -32768) scaledR = -32768;
+            g_PCMF1_RingL[g_PCMF1_RingIdx] = (int16_t)scaledL;
+            g_PCMF1_RingR[g_PCMF1_RingIdx] = (int16_t)scaledR;
+            g_PCMF1_RingIdx = (g_PCMF1_RingIdx + 1) % PCMF1_RING_SIZE;
         }
-        int32_t scaledL = (int32_t)(sL * g_PCMF1Gain);
-        int32_t scaledR = (int32_t)(sR * g_PCMF1Gain);
-        if (scaledL > 32767) scaledL = 32767; else if (scaledL < -32768) scaledL = -32768;
-        if (scaledR > 32767) scaledR = 32767; else if (scaledR < -32768) scaledR = -32768;
-        g_PCMF1_RingL[g_PCMF1_RingIdx] = (int16_t)scaledL;
-        g_PCMF1_RingR[g_PCMF1_RingIdx] = (int16_t)scaledR;
-        g_PCMF1_RingIdx = (g_PCMF1_RingIdx + 1) % PCMF1_RING_SIZE;
     }
 
     if (g_SimulationMode && !g_IsEncoding) return;
@@ -945,11 +1155,30 @@ void Visualizer_ProcessAudio(int16_t* inBuf, uint32_t samples) {
 }
 
 void Visualizer_Update(void) {
+    ProfBegin();
+
+    // --- Frame timing -------------------------------------------------------
+    // Measures the real frame period (now genuinely vsync-paced, with no osDelay anywhere
+    // in the loop) and drives every frame-rate-corrected animation constant below.
+    uint32_t now_tick = HAL_GetTick();
+    float dt_ms = (float)(now_tick - g_LastFrameTick);
+    g_LastFrameTick = now_tick;
+    if (dt_ms < 1.0f)   dt_ms = 1.0f;    // guard against duplicate ticks
+    if (dt_ms > 100.0f) dt_ms = 100.0f;  // clamp after a long stall
+    g_FrameDtMs = dt_ms;
+    g_AnimScale = dt_ms / ANIM_REF_FRAME_MS;
+
+    // Exponential smoothing corrected for a changed frame period: applying alpha once
+    // per reference frame for k reference frames is equivalent to 1-(1-alpha)^k.
+    g_AlphaAttack   = 1.0f - powf(1.0f - 0.70f, g_AnimScale);
+    g_AlphaDecay    = 1.0f - powf(1.0f - 0.10f, g_AnimScale);
+    g_VUDecayScaled = powf(g_VUDecay, g_AnimScale);
+
     handleTouch();
-    osDelay(5); // Reduce CPU load
     UpdateFSKEncode(); // Background encoding (even if panel hidden)
+    ProfStage(PROF_TOUCH);
     
-    int back_idx = 1 - front_buffer_idx;
+    int back_idx = (front_buffer_idx + 1) % FB_COUNT;
     uint32_t back_addr = fb_addresses[back_idx];
     uint32_t* back_fb = (uint32_t*)back_addr;
 
@@ -958,15 +1187,27 @@ void Visualizer_Update(void) {
     // DO NOT trigger a hardware reload yet! This fixes the flickering.
     hLtdcHandler.LayerCfg[0].FBStartAdress = back_addr; 
     
-    // Invalidate D-Cache for the HUD and Viz area only
-    SCB_InvalidateDCache_by_Addr((uint32_t*)back_addr, 480 * UI_VIZ_BOTTOM * 4);
+    // NOTE: there is deliberately no D-Cache maintenance for the framebuffer here.
+    // The D-Cache is never enabled, so the MPU's cacheable attribute on this SDRAM is
+    // nominal only and there is nothing to clean. The CMSIS SCB_*Cache*By_Addr() helpers
+    // do nothing useful - but they are NOT free: the
+    // CMSIS implementation has no "D-Cache disabled" early-out, so it walks the address
+    // range writing every 32-byte cache line to the SCB, i.e. 13800 strong peripheral
+    // writes per frame for the line below. Measured cost was ~4.6 ms per frame.
+    // If a D-Cache is ever enabled for SDRAM, these have to come back.
 
-    // Targeted Screen Clear (DMA2D) - Full Height (272)
-    // We restore full clear to ensure double-buffer consistency until partial updates are perfect.
-    FillRectDMA2D(back_fb, 0, 0, 480, 272, LCD_COLOR_BLACK);
+    // Region clear (DMA2D) - visualiser band only.
+    // The header and the button strip are fully repainted every frame, and everything
+    // below the button strip was cleared once in Visualizer_Init, so a full-screen clear
+    // is no longer needed (still double-buffer safe: each buffer is fully painted on visit).
+    // Waterfall and PCM-F1 repaint the whole band themselves, so they skip the clear.
+    if (!g_ShowWaterfall) {
+        FillRectDMA2D(back_fb, 0, UI_VIZ_TOP, 480, UI_VIZ_BOTTOM - UI_VIZ_TOP, LCD_COLOR_BLACK);
+    }
+    ProfStage(PROF_CLEAR);
 
     if (g_SimulationMode) {
-        static float simP = 0.0f; simP += 0.04f; // Slower simulation for smoother look
+        static float simP = 0.0f; simP += 0.04f * g_AnimScale; // frame-rate corrected
         peakL = (sinf(simP) + 1.0f) * 0.5f; peakR = (cosf(simP * 1.3f) + 1.0f) * 0.5f;
         for(int i=0; i<64; i++) fft_mag_sim[i] = (uint8_t)((sinf(simP + i*0.2f) + 1.0f) * 127.0f);
     } else if (fftIdx >= FFT_SIZE) {
@@ -1010,22 +1251,23 @@ void Visualizer_Update(void) {
         memmove(vRealR, vRealR + shift, (FFT_SIZE - shift) * sizeof(float));
         fftIdx = 256;
     }
+    ProfStage(PROF_FFT);
 
-    // Decay: Smoothly drop meters in UI loop
-    peakL *= g_VUDecay;
-    peakR *= g_VUDecay;
+    // Decay: Smoothly drop meters in UI loop (frame-rate corrected)
+    peakL *= g_VUDecayScaled;
+    peakR *= g_VUDecayScaled;
     
     // Global Spectrum Peak Decay
     int totalPeaks = 62; // Always 62 bands in both Mono and Split
     for(int i=0; i<totalPeaks; i++) {
-        if (g_PeakHoldCount[i] > 0) g_PeakHoldCount[i]--;
-        else if (g_SpectrumPeaks[i] > 0) g_SpectrumPeaks[i] -= g_PeakDecay;
+        if (g_PeakHoldCount[i] > 0.0f) g_PeakHoldCount[i] -= g_AnimScale;
+        else if (g_SpectrumPeaks[i] > 0.0f) g_SpectrumPeaks[i] -= (g_PeakDecay * g_AnimScale);
     }
 
     // VU Peak Decay
     for(int i=0; i<2; i++) {
-        if (g_VUPeakHoldCount[i] > 0) g_VUPeakHoldCount[i]--;
-        else if (g_VUPeaks[i] > 0) g_VUPeaks[i] -= (g_PeakDecay * 2.0f); // Fast horizontal fall
+        if (g_VUPeakHoldCount[i] > 0.0f) g_VUPeakHoldCount[i] -= g_AnimScale;
+        else if (g_VUPeaks[i] > 0.0f) g_VUPeaks[i] -= (g_PeakDecay * 2.0f * g_AnimScale); // Fast horizontal fall
     }
 
     // 2. Draw Visualizations (Background layer)
@@ -1036,6 +1278,7 @@ void Visualizer_Update(void) {
     else if (g_ShowSpectrum) drawSpectrum();
     
     if (g_ShowFSK) drawFSKText();
+    ProfStage(PROF_VIZ);
 
     // Calculate CPU Load every 500ms
     uint32_t now = HAL_GetTick();
@@ -1056,6 +1299,7 @@ void Visualizer_Update(void) {
     BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
     FillRectDMA2D(back_fb, 0, 0, 480, UI_HEADER_H, LCD_COLOR_BLUE);
     while (hdma2d.Instance->CR & DMA2D_CR_START);
+    ProfStage(PROF_HDRFILL);
 
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
     BSP_LCD_SetBackColor(LCD_COLOR_BLUE);
@@ -1069,14 +1313,40 @@ void Visualizer_Update(void) {
     static int current_fps = 0;
     
     frame_count++;
+    bool diagNow = false;
     if (HAL_GetTick() - last_fps_time >= 1000) {
         current_fps = frame_count;
         frame_count = 0;
         last_fps_time = HAL_GetTick();
-        printf("[SYS] FPS:%d | CPU:%d%%\r\n", current_fps, current_cpu_load);
+        // Diagnostics are expensive: __io_putchar() does a blocking single-byte
+        // HAL_UART_Transmit, measured at ~180 us PER CHARACTER, so the [SYS]+[PROF] pair
+        // (~165 chars) costs ~30 ms and lands in a single frame - a visible stall once a
+        // second. Emit every 3rd second while tuning; a shipping build should drop them.
+        static uint32_t diagDiv = 0;
+        diagNow = (++diagDiv >= 3);
+        if (diagNow) {
+            diagDiv = 0;
+            printf("[SYS] FPS:%d (%d.%01dms) | CPU:%d%%\r\n", current_fps, (int)g_FrameDtMs, (int)(g_FrameDtMs * 10.0f) % 10, current_cpu_load);
+        }
+
+        if (diagNow && g_ProfEnabled) {
+            printf("[PROF] dt:%dms | us/s tch:%u fft:%u vw:%u vb:%u hf:%u hp:%u ht:%u btn:%u flp:%u main:%u\r\n",
+                   (int)g_FrameDtMs,
+                   g_ProfAcc[PROF_TOUCH]    / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_FFT]      / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_VIZWAIT]  / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_VIZ]      / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_HDRFILL]  / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_HDRPRINT] / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_HDRTEXT]  / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_BTN]      / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_FLIP]     / g_ProfCyclesPerUs,
+                   g_ProfAcc[PROF_MAIN]     / g_ProfCyclesPerUs);
+            for (int i = 0; i < PROF_COUNT; i++) g_ProfAcc[i] = 0;
+        }
         
         // FSK DIAGNOSTICS
-        if (g_ShowFSK) {
+        if (diagNow && g_ShowFSK) {
             float mMag = Filter_GetMag(&g_Modem.filterMark);
             float sMag = Filter_GetMag(&g_Modem.filterSpace);
             printf("[FSK DIAG] Baud:%d | Sig:%d%% | M:%d S:%d | SNR:%f | Carr:%d\r\n", 
@@ -1088,6 +1358,7 @@ void Visualizer_Update(void) {
              g_MaxSignalLevel = 0.0f; // Reset peak hold
         }
     }
+    ProfStage(PROF_HDRPRINT);
 
     float dispL = (peakL / g_AudioGain) * 100.0f;
     float dispR = (peakR / g_AudioGain) * 100.0f;
@@ -1102,26 +1373,35 @@ void Visualizer_Update(void) {
                  WiFiApp_GetDisplayStatus(), current_cpu_load, current_fps);
     }
     BSP_LCD_DisplayStringAt(10, 7, (uint8_t*)buf, LEFT_MODE);
+    ProfStage(PROF_HDRTEXT);
 
     // Final safety wait: ensure all DMA2D operations completed before returning
     while (hdma2d.Instance->CR & DMA2D_CR_START);
     
     // 4. Draw VU Meter (Overlay at top-ish)
     if (g_ShowVUMeter) drawVU();
+    ProfStage(PROF_VU);
 
     // 5. Draw Buttons (Overlay at bottom)
     for(int i=0; i<buttonCount; i++) {
         Button* b = &buttons[i];
         uint32_t color = *b->toggleMode ? b->color : LCD_COLOR_DARKGRAY;
         FillRectDMA2D(back_fb, b->x, b->y, b->w, b->h, color);
+        // MUST wait for the fill before the CPU writes the label. FillRectDMA2D only
+        // *starts* a transfer; the engine paints the button top-down, so without this it
+        // overwrites the first glyph rows the CPU has already written - which shows up as
+        // the top of the leading character being cut, intermittently. (The header already
+        // had this wait; the button loop never did.)
+        while (hdma2d.Instance->CR & DMA2D_CR_START);
         BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
         BSP_LCD_SetBackColor(color);
         BSP_LCD_SetFont(&Font12);
         BSP_LCD_DisplayStringAt(b->x + 5, b->y + 10, (uint8_t*)b->text, LEFT_MODE);
     }
+    ProfStage(PROF_BTN);
 
     // 6. Commit Frame (VSync-Locked Flip)
-    SCB_CleanDCache_by_Addr((uint32_t*)back_addr, 480 * 272 * 4);
+    // (no D-Cache clean of the framebuffer - see the note at the top of this function)
     
     // Ensure all DMA2D operations are finished
     while (hdma2d.Instance->CR & DMA2D_CR_START);
@@ -1136,14 +1416,40 @@ void Visualizer_Update(void) {
     // 7. Flip Buffers (Hardware VSync)
 
     // Update hardware address and request Vertical Blanking Reload
+    // Drain any buffered framebuffer stores before the LTDC starts scanning this buffer.
+    // Belt and braces: with triple buffering this buffer is not scanned until the next
+    // vertical blank, by which time the store buffer has long since drained on its own.
+    __DSB();
+
     // Use NoReload variant to ensure Atomic switch at VSync
     HAL_LTDC_SetAddress_NoReload(&hLtdcHandler, back_addr, 0);
     HAL_LTDC_Reload(&hLtdcHandler, LTDC_SRCR_VBR); 
     
-    // IMPORTANT: Wait for hardware to acknowledge the flip.
-    // This prevents racing the scanline and eliminates all flickering.
-    uint32_t reload_start = HAL_GetTick();
-    while ((hLtdcHandler.Instance->SRCR & LTDC_SRCR_VBR) && (HAL_GetTick() - reload_start < 20)); 
+    // No vertical-blank wait is needed with three buffers: the buffer rendered into next
+    // is always two flips away from the one being scanned out, so the LTDC address change
+    // (applied atomically at the next vertical blank by the VBR reload) cannot race us.
+    // The old "wait for the flip" cost ~14 ms every frame. Note the SRCR.VBR status bit
+    // never reads back cleared on this device, and CDSR.VSYNCS only helped because it is a
+    // real signal - neither is needed now.
+    //
+    // The one hazard is lapping the display if the loop ever ran faster than the panel, so
+    // cap the loop at the ~59.6 Hz refresh.
+    //
+    // YIELD rather than spin. This task is osPriorityNormal, the same as StartWiFiTask, and
+    // time-slicing splits the CPU between them, so busy-waiting here steals CPU from the
+    // task that services the ESP8266's blocking UART - which corrupts the FSK text being
+    // streamed to /raw - and it also starves the FreeRTOS idle task, which is what pins the
+    // on-screen CPU figure at 100%. osDelay(1) enforces the same cap while letting every
+    // other task run.
+    static uint32_t last_flip_ms = 0;
+    uint32_t flip_now_ms;
+    do {
+        osDelay(1);
+        flip_now_ms = HAL_GetTick();
+    } while ((uint32_t)(flip_now_ms - last_flip_ms) < 17u);
+    last_flip_ms = flip_now_ms;
+
+    ProfStage(PROF_FLIP);
 
     front_buffer_idx = back_idx;
 }
@@ -1155,6 +1461,7 @@ static void drawSpectrum() {
     
     // WAIT for DMA2D background clear to finish before CPU starts drawing arrays over it
     while (hdma2d.Instance->CR & DMA2D_CR_START);
+    ProfStage(PROF_VIZWAIT);
     
     if (g_SpectrumMode == 1) {
         // --- 31/31 ISO Standard Stereo Split ---
@@ -1163,8 +1470,8 @@ static void drawSpectrum() {
         int leftX = (240 - totalW) / 2;
         int rightX = 240 + (240 - totalW) / 2;
 
-        // Draw Divider
-        for(int i=UI_VIZ_TOP; i<UI_VIZ_BOTTOM; i++) back_fb[i*480 + 240] = 0xFF555555;
+        // Draw Divider (single DMA2D fill instead of 200 individual pixel stores)
+        FillRectDMA2D(back_fb, 240, UI_VIZ_TOP, 1, UI_VIZ_BOTTOM - UI_VIZ_TOP, 0xFF555555);
 
         for(int i=0; i<31; i++) {
             // LEFT CHANNEL
@@ -1173,14 +1480,15 @@ static void drawSpectrum() {
             if (g_EnablePeakHold) {
                 if ((float)hL >= g_SpectrumPeaks[i]) { g_SpectrumPeaks[i] = (float)hL; g_PeakHoldCount[i] = g_PeakHoldFrames; }
             }
-            FillRectCPU(back_fb, leftX + i*barW, bottomY - hL, barW-1, hL, COLOR_SPEC_L);
+            // Bar and peak both go through DMA2D. The engine fills at ~5.4 cycles/pixel
+            // against ~31 for a CPU store to this non-cacheable SDRAM (both measured on
+            // hardware), and the CPU is free while the transfer runs. Using DMA2D for the
+            // peak as well means the CPU never writes into a region a transfer is filling.
+            FillRectDMA2D(back_fb, leftX + i*barW, bottomY - hL, barW-1, hL, COLOR_SPEC_L);
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (leftX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = COLOR_SPEC_L;
-                }
+                FillRectDMA2D(back_fb, leftX + i*barW, peakY, barW-1, 2, COLOR_SPEC_L);
             }
 
             // RIGHT CHANNEL
@@ -1189,14 +1497,11 @@ static void drawSpectrum() {
             if (g_EnablePeakHold) {
                 if ((float)hR >= g_SpectrumPeaks[rIdx]) { g_SpectrumPeaks[rIdx] = (float)hR; g_PeakHoldCount[rIdx] = g_PeakHoldFrames; }
             }
-            FillRectCPU(back_fb, rightX + i*barW, bottomY - hR, barW-1, hR, COLOR_SPEC_R);
+            FillRectDMA2D(back_fb, rightX + i*barW, bottomY - hR, barW-1, hR, COLOR_SPEC_R);
              if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[rIdx];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (rightX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = COLOR_SPEC_R;
-                }
+                FillRectDMA2D(back_fb, rightX + i*barW, peakY, barW-1, 2, COLOR_SPEC_R);
             }
         }
     } else if (g_SpectrumMode == 2) {
@@ -1224,7 +1529,12 @@ static void drawSpectrum() {
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
                 
-                FillRectCPU(back_fb, startX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                // LED segments must stay per-segment because of the 1 px gap, but each one
+                // goes through the DMA2D engine (R2M fill) rather than CPU stores: the
+                // engine fills at ~5.4 cycles/pixel against ~31 for a CPU store to this
+                // non-cacheable SDRAM. The peak marker uses DMA2D too so the CPU never
+                // writes into a region a transfer is still filling.
+                FillRectDMA2D(back_fb, startX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
 
             if (g_EnablePeakHold) {
@@ -1237,10 +1547,7 @@ static void drawSpectrum() {
                 else if (pPercent < 0.85f) peakColor = LCD_COLOR_YELLOW;
                 else peakColor = LCD_COLOR_RED;
 
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (startX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = peakColor;
-                }
+                FillRectDMA2D(back_fb, startX + i*barW, peakY, barW-1, 2, peakColor);
             }
         }
     } else if (g_SpectrumMode == 3) {
@@ -1253,8 +1560,8 @@ static void drawSpectrum() {
         int gap = 1;
         int totalSegH = segH + gap;
 
-        // Draw Divider
-        for(int i=UI_VIZ_TOP; i<UI_VIZ_BOTTOM; i++) back_fb[i*480 + 240] = 0xFF555555;
+        // Draw Divider (single DMA2D fill instead of 200 individual pixel stores)
+        FillRectDMA2D(back_fb, 240, UI_VIZ_TOP, 1, UI_VIZ_BOTTOM - UI_VIZ_TOP, 0xFF555555);
 
         for(int i=0; i<31; i++) {
             // LEFT CHANNEL LED
@@ -1269,7 +1576,7 @@ static void drawSpectrum() {
                 if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
-                FillRectCPU(back_fb, leftX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                FillRectDMA2D(back_fb, leftX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
@@ -1279,10 +1586,7 @@ static void drawSpectrum() {
                 if (pPercent < 0.6f) peakColor = LCD_COLOR_GREEN;
                 else if (pPercent < 0.85f) peakColor = LCD_COLOR_YELLOW;
                 else peakColor = LCD_COLOR_RED;
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (leftX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = peakColor;
-                }
+                FillRectDMA2D(back_fb, leftX + i*barW, peakY, barW-1, 2, peakColor);
             }
 
             // RIGHT CHANNEL LED
@@ -1298,7 +1602,7 @@ static void drawSpectrum() {
                 if (percent < 0.6f) segColor = LCD_COLOR_GREEN;
                 else if (percent < 0.85f) segColor = LCD_COLOR_YELLOW;
                 else segColor = LCD_COLOR_RED;
-                FillRectCPU(back_fb, rightX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
+                FillRectDMA2D(back_fb, rightX + i*barW, bottomY - (s+1)*totalSegH + gap, barW-1, segH, segColor);
             }
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[rIdx];
@@ -1308,10 +1612,7 @@ static void drawSpectrum() {
                 if (pPercent < 0.6f) peakColor = LCD_COLOR_GREEN;
                 else if (pPercent < 0.85f) peakColor = LCD_COLOR_YELLOW;
                 else peakColor = LCD_COLOR_RED;
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (rightX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = peakColor;
-                }
+                FillRectDMA2D(back_fb, rightX + i*barW, peakY, barW-1, 2, peakColor);
             }
         }
     } else {
@@ -1328,14 +1629,11 @@ static void drawSpectrum() {
             }
 
             uint32_t barColor = heatARGB[i*4%256];
-            FillRectCPU(back_fb, startX + i*barW, bottomY - h, barW-1, h, barColor);
+            FillRectDMA2D(back_fb, startX + i*barW, bottomY - h, barW-1, h, barColor);
             if (g_EnablePeakHold) {
                 int peakY = bottomY - (int)g_SpectrumPeaks[i];
                 if (peakY < UI_VIZ_TOP) peakY = UI_VIZ_TOP;
-                for(int py=0; py<2; py++) {
-                    uint32_t* row = &back_fb[(peakY + py) * 480 + (startX + i*barW)];
-                    for(int px=0; px<(barW-1); px++) row[px] = barColor;
-                }
+                FillRectDMA2D(back_fb, startX + i*barW, peakY, barW-1, 2, barColor);
             }
         }
     }
@@ -1347,17 +1645,28 @@ static void drawWaterfall() {
     int width = WFALL_WIDTH; // 480
     uint32_t* wfall_fb = (uint32_t*)WFALL_FB_ADDRESS;
 
-    // 1. Advance Circular Head
-    g_WfallHead--;
-    if (g_WfallHead < 0) g_WfallHead = height - 1;
-    
-    uint32_t* newRow = &wfall_fb[g_WfallHead * width];
+    // 1. Advance Circular Head (frame-rate corrected).
+    //    g_AnimScale rows per frame keeps the original rows-per-second scroll speed now
+    //    that the render loop runs at the panel refresh rate. On frames where the head does
+    //    not move the blit below still runs, so both framebuffers keep identical content.
+    static float wfallRowAcc = 0.0f;
+    wfallRowAcc += g_AnimScale;
+    int rowsToAdvance = (int)wfallRowAcc;
+    if (rowsToAdvance > 8) rowsToAdvance = 8;   // clamp after a long stall
+    wfallRowAcc -= (float)rowsToAdvance;
 
-    // 2. Fill new row with FFT data
+    for (int r = 0; r < rowsToAdvance; r++) {
+        g_WfallHead--;
+        if (g_WfallHead < 0) g_WfallHead = height - 1;
+    }
+    
+    // 2. Render the newest row into a line buffer (identical for every row advanced this
+    //    frame, because the FFT only updates between frames).
+    static uint32_t newRowBuf[WFALL_WIDTH];
     if (g_SimulationMode) {
         for(int x=0; x<width; x++) {
             int bin = (x * 64) / width;
-            newRow[x] = wfall_lut[fft_mag_sim[bin % 64]];
+            newRowBuf[x] = wfall_lut[fft_mag_sim[bin % 64]];
         }
     } else {
         float aMax = 0.5f;
@@ -1369,12 +1678,24 @@ static void drawWaterfall() {
             float mag = vRealFFT[bin];
             int cIdx = (int)((mag * g_WaterfallGain / aMax) * 255.0f);
             if(cIdx > 255) cIdx = 255;
-            newRow[x] = wfall_lut[cIdx];
+            newRowBuf[x] = wfall_lut[cIdx];
         }
     }
 
-    // Clean ONLY the new row in D-Cache
-    SCB_CleanDCache_by_Addr((uint32_t*)newRow, width * 4);
+    // Write the row into every ring slot the head moved over this frame. The newest row
+    // lands at g_WfallHead, the next-newest at g_WfallHead+1, and so on. If the head did
+    // not move (rowsToAdvance == 0) the newest row is refreshed in place, which is what
+    // the original per-frame code did.
+    int rowsToFill = (rowsToAdvance > 0) ? rowsToAdvance : 1;
+    for (int r = 0; r < rowsToFill; r++) {
+        int idx = g_WfallHead + r;
+        if (idx >= height) idx -= height;
+        memcpy(&wfall_fb[idx * width], newRowBuf, width * sizeof(uint32_t));
+    }
+
+    // Clean the refreshed slots in D-Cache
+    // (removed: the ring is non-cacheable and the D-Cache is disabled, so this walked
+    //  60 cache lines per frame for nothing)
 
     // 3. Draw Circular Buffer to Screen using DMA2D (Two chunks)
     uint32_t back_fb_addr = hLtdcHandler.LayerCfg[0].FBStartAdress;
@@ -1408,9 +1729,22 @@ static void drawPCMF1() {
     int monoReadIdx = 0;
     
     uint8_t bits[137];
-    
+
+    // Stage the band in internal SRAM and push it out with DMA2D bursts.
+    // Drawing straight into the SDRAM framebuffer costs ~126 cycles PER STORE (measured:
+    // 82,200 stores = 50.6 ms per frame), because each single-beat CPU write waits for a
+    // full FMC/SDRAM round trip. The DMA2D reaches ~122 MB/s on the same memory, so the
+    // rows are built in SRAM1 (.bss lives at 0x20010000 - see the linker script) and copied
+    // out in batches. Batch boundaries land on row multiples so one burst copy covers each.
+    // The bit loop never writes the margins (x < 34 or x > 444), so clearing the stage once
+    // per frame keeps them black; previously they just retained whatever was already there.
+    #define PCMF1_STAGE_ROWS 8
+    static uint32_t pcmStage[PCMF1_STAGE_ROWS * 480];
+    memset(pcmStage, 0, sizeof(pcmStage));
+
     for (int y = 0; y < height; y++) {
-        uint32_t *dest_row = back_fb + ((startY + y) * 480);
+        int batchRow = y % PCMF1_STAGE_ROWS;
+        uint32_t *dest_row = &pcmStage[batchRow * 480];
         
         memset(bits, 0, sizeof(bits));
         // Sync pattern: 0 1 0 1
@@ -1469,12 +1803,36 @@ static void drawPCMF1() {
 
         global_enc_line++;
 
-        // Draw bits
-        for (int b=0; b<BITS_PER_LINE; b++) {
-            uint32_t color = bits[b] ? LCD_COLOR_WHITE : LCD_COLOR_BLACK;
-            for (int px=0; px<BIT_WIDTH; px++) {
-                dest_row[X_OFFSET + (b*BIT_WIDTH) + px] = color;
+        // Draw bits (into the SRAM stage - see the staging note above).
+        // Pointer walk with no per-pixel index arithmetic, and runs of equal colour filled
+        // as one span. The [CAL] line in the boot log shows execution here is
+        // INSTRUCTION-limited, not memory-limited: three identical store loops measure
+        // 14 (stack) / 31 (SRAM) / 38 (SDRAM) cycles per iteration, so the destination
+        // memory costs only ~7 cycles and the real lever is executing fewer instructions
+        // per pixel. The previous code recomputed X_OFFSET + b*BIT_WIDTH + px for every
+        // one of the 411 stores in a row.
+        {
+            uint32_t* p = dest_row + X_OFFSET;
+            int b = 0;
+            while (b < BITS_PER_LINE) {
+                uint32_t color = bits[b] ? LCD_COLOR_WHITE : LCD_COLOR_BLACK;
+                int end = b + 1;
+                while (end < BITS_PER_LINE &&
+                       ((bits[end] ? LCD_COLOR_WHITE : LCD_COLOR_BLACK) == color)) {
+                    end++;
+                }
+                int n = (end - b) * BIT_WIDTH;
+                for (int i = 0; i < n; i++) p[i] = color;
+                p += n;
+                b = end;
             }
+        }
+
+        // Push the finished batch with a single burst copy. 200 rows / 8 = 25 transfers.
+        if (batchRow == PCMF1_STAGE_ROWS - 1 || y == height - 1) {
+            CopyBlockDMA2D(pcmStage,
+                            back_fb + ((startY + y - batchRow) * 480),
+                            480, batchRow + 1);
         }
     }
 }
@@ -1880,6 +2238,11 @@ static void initButtons() {
 
 static void handleTouch() {
     TS_StateTypeDef ts; if(!ts_enabled) return;
+    // BSP_TS_GetState() is a BLOCKING I2C transaction and measured ~7.6 ms of every frame.
+    // The UI already debounces accepted touches by 200 ms, so polling every 3rd frame is
+    // invisible to the user and reclaims most of that time.
+    static uint8_t tsPollSkip = 0;
+    if ((++tsPollSkip % 3) != 0) return;
     BSP_TS_GetState(&ts);
     if(ts.touchDetected) {
         static uint32_t lastT = 0; if(HAL_GetTick() - lastT < 200) return;
@@ -2175,6 +2538,12 @@ static void FillRectDMA2D(uint32_t* fb, int x, int y, int w, int h, uint32_t col
 
 static void CopyBlockDMA2D(uint32_t* src, uint32_t* dst, int width, int height) {
     while (hdma2d.Instance->CR & DMA2D_CR_START);
+    // This is the one place a DMA master reads data the CPU has just written: the waterfall
+    // ring rows filled by the memcpy in drawWaterfall(). The ring lives in SDRAM, so drain
+    // outstanding CPU writes before the DMA2D reads them, or the newest line of the
+    // waterfall can lag by one frame. Kept unconditionally so the ordering does not depend
+    // on whichever MPU attribute region 1 happens to use.
+    __DSB();
     hdma2d.Instance->CR = DMA2D_M2M;
     hdma2d.Instance->OPFCCR = DMA2D_OUTPUT_ARGB8888;
     hdma2d.Instance->FGPFCCR = DMA2D_INPUT_ARGB8888;
