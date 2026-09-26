@@ -70,6 +70,38 @@ void FSK_FIFO_Push(int16_t sample);
 int16_t FSK_FIFO_Pop(void);
 void FSK_FIFO_Reset(void);
 
+typedef struct {
+    int logLineCount;
+    int dataErrors;
+    int dataLengthErrors;
+    int invalidCharacterErrors;
+    int totalStops;
+    int sideAErrors;
+    int sideALineCount;
+    int sideBErrors;
+    int sideBLineCount;
+    char currentSide;
+    bool isDctMode;
+    int lastTotalTime;
+    
+    // Modem diagnostics
+    bool carrier;
+    float lastSNR;
+    float lastMeasuredBaud;
+    float speedError;
+    
+    // Track metadata
+    bool hasMetadata;
+    char metaFile[64];
+    char metaHash[16];
+    int metaDuration;
+    int metaBitrate;
+    char lastLine[64];
+} TapeStatsSnapshot;
+
+void Visualizer_GetStatsSnapshot(TapeStatsSnapshot* outSnapshot);
+void Visualizer_SetBaudRate(float baud);
+
 void Visualizer_GetFSKText(char* outBuf, uint16_t maxLen);
 void Visualizer_GetStatsText(char* outBuf, uint16_t maxLen);
 void Visualizer_GetLastLine(char* outBuf, uint16_t maxLen);

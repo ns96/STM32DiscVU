@@ -47,6 +47,7 @@ bool ESP8266_EnableMultipleConnections(bool enable);
 bool ESP8266_StartServer(uint16_t port);
 bool ESP8266_CloseServer(void);
 bool ESP8266_SendTCPData(uint8_t link_id, const uint8_t* data, uint16_t len);
+bool ESP8266_SendTCPDataChunked(uint8_t link_id, const uint8_t* data, uint32_t len, uint16_t chunkSize);
 bool ESP8266_CloseConnection(uint8_t link_id);
 
 // Periodic polling / worker function (called from RTOS task)

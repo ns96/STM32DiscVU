@@ -2189,26 +2189,35 @@ static void CopyBlockDMA2D(uint32_t* src, uint32_t* dst, int width, int height) 
 void Visualizer_GetFSKText(char* outBuf, uint16_t maxLen) {
     if (!outBuf || maxLen == 0) return;
     vTaskSuspendAll();
-    outBuf[0] = '\0';
-    uint16_t curLen = 0;
-    
-    // Output complete lines from oldest to newest
-    int startIdx = (g_RxLineCount < MAX_RX_LINES) ? 0 : g_RxLineHead;
-    for (int i = 0; i < g_RxLineCount; i++) {
-        int idx = (startIdx + i) % MAX_RX_LINES;
-        int lineLen = strlen(g_RxLines[idx]);
-        if (curLen + lineLen + 2 < maxLen) {
-            memcpy(outBuf + curLen, g_RxLines[idx], lineLen);
-            curLen += lineLen;
-            outBuf[curLen++] = '\n';
+    // 1. Prioritize g_FSKText scroll buffer (matches exactly what the LCD screen renders)
+    if (g_FSKTextLen > 0) {
+        if (g_FSKTextLen < maxLen) {
+            memcpy(outBuf, g_FSKText, g_FSKTextLen);
+            outBuf[g_FSKTextLen] = '\0';
+        } else {
+            uint16_t offset = g_FSKTextLen - (maxLen - 1);
+            memcpy(outBuf, g_FSKText + offset, maxLen - 1);
+            outBuf[maxLen - 1] = '\0';
+        }
+    } else {
+        outBuf[0] = '\0';
+        uint16_t curLen = 0;
+        int startIdx = (g_RxLineCount < MAX_RX_LINES) ? 0 : g_RxLineHead;
+        for (int i = 0; i < g_RxLineCount; i++) {
+            int idx = (startIdx + i) % MAX_RX_LINES;
+            int lineLen = strlen(g_RxLines[idx]);
+            if (curLen + lineLen + 2 < maxLen) {
+                memcpy(outBuf + curLen, g_RxLines[idx], lineLen);
+                curLen += lineLen;
+                outBuf[curLen++] = '\n';
+                outBuf[curLen] = '\0';
+            }
+        }
+        if (g_CurrentLineIdx > 0 && curLen + g_CurrentLineIdx + 1 < maxLen) {
+            memcpy(outBuf + curLen, g_CurrentLineBuf, g_CurrentLineIdx);
+            curLen += g_CurrentLineIdx;
             outBuf[curLen] = '\0';
         }
-    }
-    // Append current in-progress line if any
-    if (g_CurrentLineIdx > 0 && curLen + g_CurrentLineIdx + 1 < maxLen) {
-        memcpy(outBuf + curLen, g_CurrentLineBuf, g_CurrentLineIdx);
-        curLen += g_CurrentLineIdx;
-        outBuf[curLen] = '\0';
     }
     xTaskResumeAll();
 }
@@ -2285,4 +2294,72 @@ void Visualizer_TransmitFSKText(const char* text) {
     if (!text) return;
     addFSKDisplayString(text);
 }
+
+void Visualizer_GetStatsSnapshot(TapeStatsSnapshot* outSnapshot) {
+    if (!outSnapshot) return;
+    vTaskSuspendAll();
+    outSnapshot->logLineCount = g_TapeStats.logLineCount;
+    outSnapshot->dataErrors = g_TapeStats.dataErrors;
+    outSnapshot->dataLengthErrors = g_TapeStats.dataLengthErrors;
+    outSnapshot->invalidCharacterErrors = g_TapeStats.invalidCharacterErrors;
+    outSnapshot->totalStops = g_TapeStats.totalStops;
+    outSnapshot->sideAErrors = g_TapeStats.sideAErrors;
+    outSnapshot->sideALineCount = g_TapeStats.sideALineCount;
+    outSnapshot->sideBErrors = g_TapeStats.sideBErrors;
+    outSnapshot->sideBLineCount = g_TapeStats.sideBLineCount;
+    outSnapshot->currentSide = g_TapeStats.currentSide;
+    outSnapshot->isDctMode = g_TapeStats.isDctMode;
+    outSnapshot->lastTotalTime = g_TapeStats.lastTotalTime;
+    
+    outSnapshot->carrier = g_Modem.carrier;
+    outSnapshot->lastSNR = g_Modem.lastSNR;
+    outSnapshot->lastMeasuredBaud = g_Modem.lastMeasuredBaud;
+    if (g_Modem.lastMeasuredBaud > 0.0f && g_BaudRate > 0.0f) {
+        outSnapshot->speedError = (g_Modem.lastMeasuredBaud - g_BaudRate) * 100.0f / g_BaudRate;
+    } else {
+        outSnapshot->speedError = 0.0f;
+    }
+    
+    outSnapshot->hasMetadata = g_HasMetadata;
+    if (g_HasMetadata) {
+        const char* p = g_CurrentTrack.sourcePath;
+        const char* f1 = strrchr(p, '/');
+        const char* f2 = strrchr(p, '\\');
+        if (f1) p = f1 + 1;
+        else if (f2) p = f2 + 1;
+        strncpy(outSnapshot->metaFile, p, sizeof(outSnapshot->metaFile) - 1);
+        outSnapshot->metaFile[sizeof(outSnapshot->metaFile) - 1] = '\0';
+        strncpy(outSnapshot->metaHash, g_CurrentTrack.hash, sizeof(outSnapshot->metaHash) - 1);
+        outSnapshot->metaHash[sizeof(outSnapshot->metaHash) - 1] = '\0';
+        outSnapshot->metaDuration = g_CurrentTrack.duration;
+        outSnapshot->metaBitrate = g_CurrentTrack.bitrate;
+    } else {
+        outSnapshot->metaFile[0] = '\0';
+        outSnapshot->metaHash[0] = '\0';
+        outSnapshot->metaDuration = 0;
+        outSnapshot->metaBitrate = 0;
+    }
+    
+    if (g_ReadyLineBuf[0] != '\0') {
+        strncpy(outSnapshot->lastLine, g_ReadyLineBuf, sizeof(outSnapshot->lastLine) - 1);
+        outSnapshot->lastLine[sizeof(outSnapshot->lastLine) - 1] = '\0';
+    } else if (g_CurrentLineIdx > 0 && g_CurrentLineBuf[0] != '\0') {
+        strncpy(outSnapshot->lastLine, g_CurrentLineBuf, sizeof(outSnapshot->lastLine) - 1);
+        outSnapshot->lastLine[sizeof(outSnapshot->lastLine) - 1] = '\0';
+    } else {
+        outSnapshot->lastLine[0] = '\0';
+    }
+    xTaskResumeAll();
+}
+
+void Visualizer_SetBaudRate(float baud) {
+    if (baud == 300.0f || baud == 600.0f || baud == 1200.0f) {
+        g_BaudRate = baud;
+        if (baud == 300.0f) g_BaudIdx = 0;
+        else if (baud == 600.0f) g_BaudIdx = 1;
+        else g_BaudIdx = 2;
+        initFSKModems();
+    }
+}
+
 

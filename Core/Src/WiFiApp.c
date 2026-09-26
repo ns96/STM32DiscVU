@@ -1,6 +1,7 @@
 #include "WiFiApp.h"
 #include "ESP8266.h"
 #include "VisualizerApp.h"
+#include "WebUI_HTML.h"
 #include "fatfs.h"
 #include "cmsis_os.h"
 #include <stdio.h>
@@ -29,8 +30,10 @@ static char s_HttpTxBuf[2048]; // EXCLUSIVELY used inside SendHTTPResponse
 static char s_RxTextRaw[768];
 static char s_RxTextJson[600];
 static char s_StatsText[128];
-static char s_JsonBody[1024];
+static char s_JsonBody[2048];
 static char s_InfoBuf[1024];
+static char s_LastLineJson[128];
+static char s_MetaFileJson[128];
 
 // Case-insensitive string comparison helpers
 static int ci_strncasecmp(const char* s1, const char* s2, size_t n) {
@@ -118,21 +121,68 @@ static void SendHTTPResponse(uint8_t link_id, const char* content_type, const ch
     ESP8266_CloseConnection(link_id);
 }
 
-// Sanitize string for JSON (escape quotes and newlines)
+// Helper to send large HTTP Response in chunked AT+CIPSEND packets (with CORS & caching options)
+static void SendHTTPResponseLarge(uint8_t link_id, const char* content_type, const char* body, bool cacheable) {
+    if (!body) return;
+    uint32_t bodyLen = (uint32_t)strlen(body);
+    
+    // Chunk 1: Combine HTTP Header + first portion of body in a single atomic 2048-byte buffer
+    int headerLen = snprintf(s_HttpTxBuf, sizeof(s_HttpTxBuf),
+        "HTTP/1.1 200 OK\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %lu\r\n"
+        "%s"
+        "Connection: close\r\n\r\n",
+        content_type ? content_type : "text/html",
+        (unsigned long)bodyLen,
+        cacheable ? "Cache-Control: public, max-age=3600\r\n" : "Cache-Control: no-cache\r\n");
+
+    if (headerLen <= 0 || headerLen >= (int)sizeof(s_HttpTxBuf)) return;
+
+    uint32_t bodyOffset = 0;
+    uint32_t firstBodyChunk = sizeof(s_HttpTxBuf) - headerLen;
+    if (firstBodyChunk > bodyLen) firstBodyChunk = bodyLen;
+
+    memcpy(s_HttpTxBuf + headerLen, body, firstBodyChunk);
+    bodyOffset += firstBodyChunk;
+
+    // Send first combined packet (Header + Body start) in 1 AT+CIPSEND
+    if (!ESP8266_SendTCPData(link_id, (const uint8_t*)s_HttpTxBuf, (uint16_t)(headerLen + firstBodyChunk))) {
+        ESP8266_CloseConnection(link_id);
+        return;
+    }
+
+    // Send remaining body chunks if any (in 2048-byte chunks)
+    if (bodyOffset < bodyLen) {
+        osDelay(15);
+        ESP8266_SendTCPDataChunked(link_id, (const uint8_t*)(body + bodyOffset), bodyLen - bodyOffset, 2048);
+    }
+
+    osDelay(20);
+    ESP8266_CloseConnection(link_id);
+}
+
+// Sanitize string for JSON (escape quotes, slashes, newlines, and filter control codes that break JSON parsing)
 static void EscapeForJSON(const char* src, char* dst, uint16_t maxLen) {
+    if (!src || !dst || maxLen == 0) return;
     uint16_t d = 0;
-    while (*src && d < maxLen - 4) {
-        if (*src == '\"') {
+    while (*src && d < maxLen - 6) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '\"') {
             dst[d++] = '\\'; dst[d++] = '\"';
-        } else if (*src == '\\') {
+        } else if (c == '\\') {
             dst[d++] = '\\'; dst[d++] = '\\';
-        } else if (*src == '\n') {
+        } else if (c == '\n') {
             dst[d++] = '\\'; dst[d++] = 'n';
-        } else if (*src == '\r') {
+        } else if (c == '\r') {
             // skip carriage return in json
-        } else {
-            dst[d++] = *src;
+        } else if (c == '\t') {
+            dst[d++] = '\\'; dst[d++] = 't';
+        } else if (c >= 32 && c <= 126) {
+            dst[d++] = (char)c;
         }
+        // silently omit invalid control characters (< 32) and binary noise (> 126)
         src++;
     }
     dst[d] = '\0';
@@ -188,22 +238,14 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
         return;
     }
 
-    // 3. GET / (Root endpoint - handles ?mode=decode or ?mode=pass query param)
+    // 3. GET / (Root endpoint - serves WebUI_HTML telemetry & remote dashboard)
     if (strncmp(req, "GET / ", 6) == 0 || strncmp(req, "GET /?", 6) == 0 || ci_strncasecmp(req, "GET /index.html", 15) == 0) {
         if (ci_strstr(req, "mode=decode")) {
             Visualizer_SetDCTMode(true);
         } else if (ci_strstr(req, "mode=pass")) {
             Visualizer_SetDCTMode(false);
         }
-        SendHTTPResponse(link_id, "text/html",
-            "<!DOCTYPE html><html><head><title>STM32DiscVu Modem</title></head>"
-            "<body style=\"font-family:sans-serif;background:#111;color:#eee;padding:20px;\">"
-            "<h2>STM32DiscVu FSK Modem Online</h2>"
-            "<p>API Endpoints: <a style=\"color:#0ff;\" href=\"/info\">/info</a> | "
-            "<a style=\"color:#0ff;\" href=\"/raw\">/raw</a> | "
-            "<a style=\"color:#0ff;\" href=\"/api/status\">/api/status</a> | "
-            "<a style=\"color:#0ff;\" href=\"/dct\">/dct</a></p>"
-            "</body></html>\n");
+        SendHTTPResponseLarge(link_id, "text/html", WEB_UI_HTML, true);
         return;
     }
 
@@ -242,21 +284,67 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
 
     // 6. GET /api/status (JSON Telemetry with FSK & System Stats)
     if (ci_strncasecmp(req, "GET /api/status", 15) == 0) {
+        TapeStatsSnapshot snapshot;
+        Visualizer_GetStatsSnapshot(&snapshot);
         Visualizer_GetFSKText(s_RxTextRaw, sizeof(s_RxTextRaw));
         Visualizer_GetStatsText(s_StatsText, sizeof(s_StatsText));
         EscapeForJSON(s_RxTextRaw, s_RxTextJson, sizeof(s_RxTextJson));
+        EscapeForJSON(snapshot.lastLine, s_LastLineJson, sizeof(s_LastLineJson));
+        EscapeForJSON(snapshot.metaFile, s_MetaFileJson, sizeof(s_MetaFileJson));
+
+        int h = snapshot.lastTotalTime / 3600;
+        int m = (snapshot.lastTotalTime % 3600) / 60;
+        int s = snapshot.lastTotalTime % 60;
+        char timecode[32];
+        snprintf(timecode, sizeof(timecode), "%02d:%02d:%02d", h, m, s);
+
+        float sideAPerc = (snapshot.sideALineCount > 0) ? ((float)snapshot.sideAErrors * 100.0f / (float)snapshot.sideALineCount) : 0.0f;
+        float sideBPerc = (snapshot.sideBLineCount > 0) ? ((float)snapshot.sideBErrors * 100.0f / (float)snapshot.sideBLineCount) : 0.0f;
+
+        extern bool g_ShowFSKEncode;
 
         snprintf(s_JsonBody, sizeof(s_JsonBody),
-            "{\"param_bat\":100,\"param_cpu\":%d,\"param_baud\":%d,\"param_measured_baud\":%.1f,"
-            "\"param_speed_error\":%.2f,\"param_wf_pct\":0.0,\"param_test\":false,\"param_dct\":%s,"
-            "\"param_tape_scale\":%s,\"param_spk\":false,\"param_ip\":\"%s\",\"param_version\":\"v0.7.0\",\"rx_text\":\"%s\",\"stats_text\":\"%s\"}",
+            "{"
+            "\"param_cpu\":%d,\"param_baud\":%d,\"param_measured_baud\":%.1f,"
+            "\"param_speed_error\":%.2f,\"param_wf_pct\":0.0,\"param_wf_peak\":0.0,\"param_test\":%s,\"param_dct\":%s,"
+            "\"param_tape_scale\":%s,\"param_spk\":false,\"param_ip\":\"%s\",\"param_version\":\"v0.7.0\","
+            "\"side\":\"%c\",\"timecode\":\"%s\",\"time_seconds\":%d,\"total_recs\":%d,\"data_errors\":%d,"
+            "\"len_errors\":%d,\"num_errors\":%d,\"stops\":%d,\"side_a_count\":%d,\"side_a_err\":%.1f,"
+            "\"side_b_count\":%d,\"side_b_err\":%.1f,\"carrier\":%s,\"snr\":%.1f,\"mode\":\"%s\","
+            "\"has_meta\":%s,\"meta_file\":\"%s\",\"now_playing\":\"%s\",\"meta_hash\":\"%s\",\"meta_dur\":\"%02d:%02d\",\"meta_bitrate\":%d,"
+            "\"last_record\":\"%s\",\"rx_text\":\"%s\",\"stats_text\":\"%s\""
+            "}",
             current_cpu_load,
             (int)g_BaudRate,
-            Visualizer_GetMeasuredBaud(),
-            Visualizer_GetSpeedError(),
-            Visualizer_IsDCTMode() ? "true" : "false",
+            (double)snapshot.lastMeasuredBaud,
+            (double)snapshot.speedError,
+            g_ShowFSKEncode ? "true" : "false",
+            snapshot.isDctMode ? "true" : "false",
             Visualizer_IsProportionalMode() ? "true" : "false",
             ESP8266_GetStatusString(),
+            snapshot.currentSide,
+            timecode,
+            snapshot.lastTotalTime,
+            snapshot.logLineCount,
+            snapshot.dataErrors,
+            snapshot.dataLengthErrors,
+            snapshot.invalidCharacterErrors,
+            snapshot.totalStops,
+            snapshot.sideALineCount,
+            (double)sideAPerc,
+            snapshot.sideBLineCount,
+            (double)sideBPerc,
+            snapshot.carrier ? "true" : "false",
+            (double)snapshot.lastSNR,
+            snapshot.isDctMode ? "DCT AUTO" : "GENERIC",
+            snapshot.hasMetadata ? "true" : "false",
+            s_MetaFileJson,
+            snapshot.hasMetadata ? s_MetaFileJson : "",
+            snapshot.metaHash,
+            snapshot.metaDuration / 60,
+            snapshot.metaDuration % 60,
+            snapshot.metaBitrate,
+            s_LastLineJson,
             s_RxTextJson,
             s_StatsText);
 
@@ -264,7 +352,7 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
         return;
     }
 
-    // 7. POST /api/cmd (Commands such as reset, baud, dct_mode)
+    // 7. POST /api/cmd (Commands such as reset, baud, dct_mode, test_mode, macro)
     if (ci_strncasecmp(req, "POST /api/cmd", 13) == 0) {
         if (ci_strstr(req, "\"reset\"")) {
             Visualizer_ResetFSK();
@@ -275,6 +363,26 @@ static void WiFiApp_HandleIncomingPacket(uint8_t link_id, const uint8_t* data, u
             } else {
                 Visualizer_SetDCTMode(false);
             }
+        }
+        if (ci_strstr(req, "\"baud\"")) {
+            if (ci_strstr(req, "300")) {
+                Visualizer_SetBaudRate(300.0f);
+            } else if (ci_strstr(req, "600")) {
+                Visualizer_SetBaudRate(600.0f);
+            } else if (ci_strstr(req, "1200")) {
+                Visualizer_SetBaudRate(1200.0f);
+            }
+        }
+        if (ci_strstr(req, "\"test_mode\"")) {
+            extern bool g_ShowFSKEncode;
+            if (ci_strstr(req, "\"val\":1") || ci_strstr(req, "\"val\": 1") || ci_strstr(req, "true")) {
+                g_ShowFSKEncode = true;
+            } else {
+                g_ShowFSKEncode = false;
+            }
+        }
+        if (ci_strstr(req, "\"macro\"")) {
+            Visualizer_TransmitFSKText("TEST FSK 1200 BAUD\n");
         }
         SendHTTPResponse(link_id, "text/plain", "OK\n");
         return;

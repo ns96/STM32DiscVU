@@ -388,6 +388,25 @@ bool ESP8266_SendTCPData(uint8_t link_id, const uint8_t* data, uint16_t len) {
     return false;
 }
 
+// Send TCP Data in sequential chunks (handles payloads > 2048 bytes)
+bool ESP8266_SendTCPDataChunked(uint8_t link_id, const uint8_t* data, uint32_t len, uint16_t chunkSize) {
+    if (!data || len == 0) return false;
+    if (chunkSize == 0 || chunkSize > 2048) chunkSize = 1024;
+
+    uint32_t offset = 0;
+    while (offset < len) {
+        uint16_t thisChunk = (uint16_t)((len - offset > chunkSize) ? chunkSize : (len - offset));
+        if (!ESP8266_SendTCPData(link_id, data + offset, thisChunk)) {
+            return false;
+        }
+        offset += thisChunk;
+        if (offset < len) {
+            osDelay(10);
+        }
+    }
+    return true;
+}
+
 // Close connection
 bool ESP8266_CloseConnection(uint8_t link_id) {
     char cmd[32];

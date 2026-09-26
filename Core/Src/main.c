@@ -1917,7 +1917,8 @@ void StartModemTask(void const * argument) {
             }
 
             extern volatile bool g_IsEncoding;
-            if (g_ShowFSK && !g_IsEncoding) {
+            extern bool WiFiApp_IsConnected(void);
+            if ((g_ShowFSK || WiFiApp_IsConnected()) && !g_IsEncoding) {
                 for (int i = 0; i < MODEM_CHUNK_SIZE; i++) {
                     char c = FSK_Modem_ProcessRX(&g_Modem, rxChunk.samples[i]);
                     if (c) addFSKChar(c);
